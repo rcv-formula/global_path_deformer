@@ -18,26 +18,26 @@ global_path_deformer:
     unknown_occupied: true
     scan_overlay_enabled: true
     scan_overlay_ttl_ms: 250
-    scan_overlay_min_range: 0.10
+    scan_overlay_min_range: 2.0
     scan_overlay_max_range: 0.0
     scan_overlay_stride: 1
-    scan_overlay_extra_margin: 0.05
+    scan_overlay_extra_margin: 0.10
 
     backward_waypoints: 8
     forward_waypoints: 20
     gap_tolerance: 2
     closed_loop_path: true
     use_full_path_search: true
-    collision_search_start_ahead_waypoints: 8
+    collision_search_start_ahead_waypoints: 3
     collision_search_lookahead_waypoints: 160
     deformation_hold_cycles: -1
 
     shift_step: 0.05
-    max_shift: 0.50
+    max_shift: 3.0
     allow_opposite_shift: true
     collision_check_step: 0.05
     process_period_ms: 20
 
     metrics_enabled: true
-    metrics_csv_path: /home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv
+    metrics_csv_path: /home/rcv/global_path_deformer/metrics/global_path_deformer_metrics.csv
     metrics_flush_period: 20

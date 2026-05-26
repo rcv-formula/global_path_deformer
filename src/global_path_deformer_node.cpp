@@ -1102,10 +1102,20 @@ private:
           state = "holding";
           logHoldState(closest_index, search_start, search_end, "safe shift search failed");
         } else {
-          clearActiveDeformation();
           state = "unsafe";
+          if (hasActiveDeformation()) {
+            deformations = active_deformations_;
+            ++active_clear_cycles_;
+          } else {
+            clearActiveDeformation();
+          }
           logUnsafeState(
-            collision_indices.size(), cluster_count, closest_index, search_start, search_end);
+            collision_indices.size(),
+            cluster_count,
+            closest_index,
+            search_start,
+            search_end,
+            !deformations.empty());
         }
       }
     } else if (canHoldActiveDeformation(search_start)) {
@@ -1330,7 +1340,7 @@ private:
 
   bool canHoldActiveDeformation(int search_start) const
   {
-    if (!active_deformation_valid_ || active_deformations_.empty()) {
+    if (!hasActiveDeformation()) {
       return false;
     }
     if (deformation_hold_cycles_ >= 0 && active_clear_cycles_ >= deformation_hold_cycles_) {
@@ -1340,6 +1350,11 @@ private:
       return false;
     }
     return !deformationsCollision(active_deformations_);
+  }
+
+  bool hasActiveDeformation() const
+  {
+    return active_deformation_valid_ && !active_deformations_.empty();
   }
 
   void clearActiveDeformation()
@@ -1520,16 +1535,44 @@ private:
     size_t cluster_count,
     int closest_index,
     int search_start,
-    int search_end)
+    int search_end,
+    bool keeping_active_deformation)
   {
     if (!shouldLogStatus()) {
       return;
     }
 
     last_had_collision_ = true;
+    if (keeping_active_deformation && !active_deformations_.empty()) {
+      double min_shift = active_deformations_.front().shift;
+      double max_shift = active_deformations_.front().shift;
+      for (const auto & deformation : active_deformations_) {
+        min_shift = std::min(min_shift, deformation.shift);
+        max_shift = std::max(max_shift, deformation.shift);
+      }
+
+      RCLCPP_WARN(
+        get_logger(),
+        "no collision-free shift found: closest=%d target=%d search=[%d,%d] collision_points=%zu clusters=%zu max_shift=%.2f check_step=%.3f. Keeping previous deformation applied=%zu window_span=[%d,%d] shift_range=[%.2f,%.2f] instead of reverting to original path.",
+        closest_index,
+        search_start,
+        search_start,
+        search_end,
+        collision_count,
+        cluster_count,
+        max_shift_,
+        effectiveCollisionCheckStep(),
+        active_deformations_.size(),
+        active_deformations_.front().window.start,
+        active_deformations_.back().window.end,
+        min_shift,
+        max_shift);
+      return;
+    }
+
     RCLCPP_WARN(
       get_logger(),
-      "no collision-free shift found: closest=%d target=%d search=[%d,%d] collision_points=%zu clusters=%zu max_shift=%.2f check_step=%.3f. Publishing original path instead of crossing occupied or out-of-map cells.",
+      "no collision-free shift found: closest=%d target=%d search=[%d,%d] collision_points=%zu clusters=%zu max_shift=%.2f check_step=%.3f. No previous deformation is available, publishing original path.",
       closest_index,
       search_start,
       search_start,
