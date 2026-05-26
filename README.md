@@ -13,16 +13,6 @@ ROS2 Humble package for locally deforming a global path using a realtime `nav_ms
 - `/Path` (`nav_msgs/Path`): corrected path.
 - `/local_path` (`visualization_msgs/Marker`): corrected window marker.
 
-## Build
-
-```bash
-cd ~/ros2_ws/src
-unzip global_path_deformer.zip
-cd ~/ros2_ws
-colcon build --packages-select global_path_deformer
-source install/setup.bash
-```
-
 ## Vehicle launch
 
 ```bash

@@ -1,0 +1,9 @@
+build/
+log/
+install/
+.gitignore
+metrics/
+*.pyc
+
+launch/__pycache__/
+*.csv

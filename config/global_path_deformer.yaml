@@ -1,0 +1,36 @@
+global_path_deformer:
+  ros__parameters:
+    odom_topic: /odom
+    realtime_map_topic: /map
+    static_obstacle_topic: /static_obstacle
+    dynamic_obstacle_topic: /dynamic_obstacle
+    obj_flag_topic: /obj_flag
+    global_path_topic: /global_path
+    output_path_topic: /Path
+    marker_topic: /local_path
+
+    robot_radius: 0.14
+    vehicle_width: 0.28
+    vehicle_length: 0.512
+    footprint_margin: 0.10
+    occupied_threshold: 65
+    unknown_occupied: true
+
+    backward_waypoints: 8
+    forward_waypoints: 20
+    gap_tolerance: 2
+    closed_loop_path: true
+    use_full_path_search: true
+    collision_search_start_ahead_waypoints: 8
+    collision_search_lookahead_waypoints: 160
+    deformation_hold_cycles: 15
+
+    shift_step: 0.05
+    max_shift: 0.50
+    allow_opposite_shift: true
+    collision_check_step: 0.05
+    process_period_ms: 20
+
+    metrics_enabled: true
+    metrics_csv_path: /home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv
+    metrics_flush_period: 20
