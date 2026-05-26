@@ -102,7 +102,7 @@ public:
       declare_parameter<int>("collision_search_start_ahead_waypoints", 8);
     collision_search_lookahead_waypoints_ =
       declare_parameter<int>("collision_search_lookahead_waypoints", 160);
-    deformation_hold_cycles_ = declare_parameter<int>("deformation_hold_cycles", 15);
+    deformation_hold_cycles_ = declare_parameter<int>("deformation_hold_cycles", -1);
 
     shift_step_ = declare_parameter<double>("shift_step", 0.05);
     max_shift_ = declare_parameter<double>("max_shift", 0.50);
@@ -336,6 +336,8 @@ private:
 
   bool isFootprintCollision(double x, double y, double yaw) const
   {
+    if (isScanOverlayCollision(x, y, yaw)) return true;
+
     int mx = 0;
     int my = 0;
     if (!worldToMap(x, y, mx, my)) return true;
@@ -370,8 +372,6 @@ private:
         if (isOccupiedCost(cost)) return true;
       }
     }
-
-    if (isScanOverlayCollision(x, y, yaw)) return true;
 
     return false;
   }
@@ -756,8 +756,33 @@ private:
 
   int estimateShiftSign(int is, int ie) const
   {
-    double signed_sum = 0.0;
-    int count = 0;
+    double scan_signed_sum = 0.0;
+    int scan_count = 0;
+
+    if (scanOverlayFresh()) {
+      const double radius = footprintBoundingRadius() + std::max(0.0, scan_overlay_extra_margin_);
+      forEachIndexInForwardRange(is, ie, [&](int i) {
+        double nx = 0.0;
+        double ny = 0.0;
+        computeNormal(i, nx, ny);
+        if (std::hypot(nx, ny) < 1e-6) return;
+
+        for (const auto & obstacle : scan_obstacles_) {
+          const double vx = obstacle.x - global_path_[i].x;
+          const double vy = obstacle.y - global_path_[i].y;
+          if (std::hypot(vx, vy) > radius) continue;
+          scan_signed_sum += vx * nx + vy * ny;
+          ++scan_count;
+        }
+      });
+    }
+
+    if (scan_count > 0) {
+      return scan_signed_sum > 0.0 ? -1 : 1;
+    }
+
+    double map_signed_sum = 0.0;
+    int map_count = 0;
     const int r_cell = static_cast<int>(std::ceil(footprintBoundingRadius() / map_.info.resolution));
 
     forEachIndexInForwardRange(is, ie, [&](int i) {
@@ -782,34 +807,15 @@ private:
 
           const double vx = cell_x - global_path_[i].x;
           const double vy = cell_y - global_path_[i].y;
-          signed_sum += vx * nx + vy * ny;
-          ++count;
+          map_signed_sum += vx * nx + vy * ny;
+          ++map_count;
         }
       }
     });
 
-    if (scanOverlayFresh()) {
-      const double radius = footprintBoundingRadius() + std::max(0.0, scan_overlay_extra_margin_);
-      forEachIndexInForwardRange(is, ie, [&](int i) {
-        double nx = 0.0;
-        double ny = 0.0;
-        computeNormal(i, nx, ny);
-        if (std::hypot(nx, ny) < 1e-6) return;
-
-        for (const auto & obstacle : scan_obstacles_) {
-          if (isMapOccupiedWorld(obstacle.x, obstacle.y)) continue;
-          const double vx = obstacle.x - global_path_[i].x;
-          const double vy = obstacle.y - global_path_[i].y;
-          if (std::hypot(vx, vy) > radius) continue;
-          signed_sum += vx * nx + vy * ny;
-          ++count;
-        }
-      });
-    }
-
-    if (count == 0) return 0;
+    if (map_count == 0) return 0;
     // Obstacle on +normal side means shift to -normal side.
-    return signed_sum > 0.0 ? -1 : 1;
+    return map_signed_sum > 0.0 ? -1 : 1;
   }
 
   bool pathRangeCollision(
@@ -1043,56 +1049,64 @@ private:
     if (!collision_indices.empty()) {
       const auto clusters = getCollisionClusters(collision_indices);
       cluster_count = clusters.size();
-      int min_window_start = use_full_path_search_ ? 0 : search_start;
 
-      for (const auto & cluster : clusters) {
-        const int ia = cluster.first;
-        const int ib = cluster.second;
-        DeformationWindow window = getWindow(ia, ib, min_window_start);
-        if (!window.active()) {
-          ++failed_clusters;
-          failure_details.push_back(makeFailureDetail(ia, ib, window, 0, "invalid_window"));
-          continue;
-        }
-
-        const int shift_sign = estimateShiftSign(ia, ib);
-        double d_req = 0.0;
-        std::string failure_reason;
-        const bool safe_shift_found =
-          findSafeShift(window, shift_sign, deformations, d_req, failure_reason);
-        if (safe_shift_found) {
-          deformations.push_back(PathDeformation{window, d_req});
-          min_window_start = window.end + 1;
-        } else {
-          ++failed_clusters;
-          failure_details.push_back(makeFailureDetail(ia, ib, window, shift_sign, failure_reason));
-        }
-      }
-
-      if (!deformations.empty()) {
-        active_deformation_valid_ = true;
-        active_deformations_ = deformations;
-        active_clear_cycles_ = 0;
-        state = "deforming";
-        logDeformationState(
-          collision_indices.size(),
-          cluster_count,
-          deformations.size(),
-          failed_clusters,
-          closest_index,
-          search_start,
-          search_end,
-          deformations);
-      } else if (canHoldActiveDeformation(search_start)) {
+      if (canHoldActiveDeformation(search_start)) {
         deformations = active_deformations_;
         ++active_clear_cycles_;
         state = "holding";
-        logHoldState(closest_index, search_start, search_end, "safe shift search failed");
+        logHoldState(closest_index, search_start, search_end, "active path remains collision-free");
       } else {
-        clearActiveDeformation();
-        state = "unsafe";
-        logUnsafeState(
-          collision_indices.size(), cluster_count, closest_index, search_start, search_end);
+        int min_window_start = use_full_path_search_ ? 0 : search_start;
+
+        for (const auto & cluster : clusters) {
+          const int ia = cluster.first;
+          const int ib = cluster.second;
+          DeformationWindow window = getWindow(ia, ib, min_window_start);
+          if (!window.active()) {
+            ++failed_clusters;
+            failure_details.push_back(makeFailureDetail(ia, ib, window, 0, "invalid_window"));
+            continue;
+          }
+
+          const int shift_sign = estimateShiftSign(ia, ib);
+          double d_req = 0.0;
+          std::string failure_reason;
+          const bool safe_shift_found =
+            findSafeShift(window, shift_sign, deformations, d_req, failure_reason);
+          if (safe_shift_found) {
+            deformations.push_back(PathDeformation{window, d_req});
+            min_window_start = window.end + 1;
+          } else {
+            ++failed_clusters;
+            failure_details.push_back(makeFailureDetail(ia, ib, window, shift_sign, failure_reason));
+          }
+        }
+
+        if (!deformations.empty()) {
+          active_deformation_valid_ = true;
+          active_deformations_ = deformations;
+          active_clear_cycles_ = 0;
+          state = "deforming";
+          logDeformationState(
+            collision_indices.size(),
+            cluster_count,
+            deformations.size(),
+            failed_clusters,
+            closest_index,
+            search_start,
+            search_end,
+            deformations);
+        } else if (canHoldActiveDeformation(search_start)) {
+          deformations = active_deformations_;
+          ++active_clear_cycles_;
+          state = "holding";
+          logHoldState(closest_index, search_start, search_end, "safe shift search failed");
+        } else {
+          clearActiveDeformation();
+          state = "unsafe";
+          logUnsafeState(
+            collision_indices.size(), cluster_count, closest_index, search_start, search_end);
+        }
       }
     } else if (canHoldActiveDeformation(search_start)) {
       deformations = active_deformations_;
@@ -1319,7 +1333,7 @@ private:
     if (!active_deformation_valid_ || active_deformations_.empty()) {
       return false;
     }
-    if (active_clear_cycles_ >= deformation_hold_cycles_) {
+    if (deformation_hold_cycles_ >= 0 && active_clear_cycles_ >= deformation_hold_cycles_) {
       return false;
     }
     if (search_start > active_deformations_.back().window.end) {
@@ -1480,10 +1494,13 @@ private:
       min_shift = std::min(min_shift, deformation.shift);
       max_shift = std::max(max_shift, deformation.shift);
     }
+    const std::string hold_limit = deformation_hold_cycles_ >= 0 ?
+      std::to_string(deformation_hold_cycles_) :
+      "unlimited";
 
     RCLCPP_INFO(
       get_logger(),
-      "holding deformation: reason=%s closest=%d target=%d search=[%d,%d] applied=%zu window_span=[%d,%d] shift_range=[%.2f,%.2f] hold_cycle=%d/%d",
+      "holding deformation: reason=%s closest=%d target=%d search=[%d,%d] applied=%zu window_span=[%d,%d] shift_range=[%.2f,%.2f] hold_cycle=%d/%s",
       reason,
       closest_index,
       search_start,
@@ -1495,7 +1512,7 @@ private:
       min_shift,
       max_shift,
       active_clear_cycles_,
-      deformation_hold_cycles_);
+      hold_limit.c_str());
   }
 
   void logUnsafeState(
@@ -1607,7 +1624,7 @@ private:
   bool use_full_path_search_{true};
   int collision_search_start_ahead_waypoints_{8};
   int collision_search_lookahead_waypoints_{160};
-  int deformation_hold_cycles_{15};
+  int deformation_hold_cycles_{-1};
   double shift_step_{0.05};
   double max_shift_{0.50};
   bool allow_opposite_shift_{true};

@@ -30,7 +30,7 @@ global_path_deformer:
     use_full_path_search: true
     collision_search_start_ahead_waypoints: 8
     collision_search_lookahead_waypoints: 160
-    deformation_hold_cycles: 50
+    deformation_hold_cycles: -1
 
     shift_step: 0.05
     max_shift: 0.50
