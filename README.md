@@ -1,6 +1,12 @@
 # global_path_deformer
 
-ROS2 Humble package for locally deforming a global path using a realtime `nav_msgs/OccupancyGrid` map.
+ROS 2 Jazzy package for Ubuntu 24.04. It locally deforms a global path using a realtime `nav_msgs/OccupancyGrid` map.
+
+## Environment
+
+- Ubuntu 24.04
+- ROS 2 Jazzy
+- C++17
 
 ## Inputs
 
