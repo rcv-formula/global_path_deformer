@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 
 struct Waypoint
@@ -51,6 +53,12 @@ struct PathDeformation
   }
 };
 
+struct ScanObstacle
+{
+  double x{0.0};
+  double y{0.0};
+};
+
 class GlobalPathDeformer : public rclcpp::Node
 {
 public:
@@ -62,6 +70,7 @@ public:
 
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/odom");
     realtime_map_topic_ = declare_parameter<std::string>("realtime_map_topic", "/map");
+    scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan_matched_points2");
     global_path_topic_ = declare_parameter<std::string>("global_path_topic", "/global_path");
     output_path_topic_ = declare_parameter<std::string>("output_path_topic", "/Path");
     marker_topic_ = declare_parameter<std::string>("marker_topic", "/local_path");
@@ -77,6 +86,12 @@ public:
     footprint_margin_ = declare_parameter<double>("footprint_margin", 0.10);
     occupied_threshold_ = declare_parameter<int>("occupied_threshold", 65);
     unknown_occupied_ = declare_parameter<bool>("unknown_occupied", true);
+    scan_overlay_enabled_ = declare_parameter<bool>("scan_overlay_enabled", true);
+    scan_overlay_ttl_ms_ = declare_parameter<int>("scan_overlay_ttl_ms", 250);
+    scan_overlay_min_range_ = declare_parameter<double>("scan_overlay_min_range", 0.10);
+    scan_overlay_max_range_ = declare_parameter<double>("scan_overlay_max_range", 0.0);
+    scan_overlay_stride_ = declare_parameter<int>("scan_overlay_stride", 1);
+    scan_overlay_extra_margin_ = declare_parameter<double>("scan_overlay_extra_margin", 0.05);
 
     backward_waypoints_ = declare_parameter<int>("backward_waypoints", 8);
     forward_waypoints_ = declare_parameter<int>("forward_waypoints", 20);
@@ -113,6 +128,12 @@ public:
       odom_topic_, qos,
       std::bind(&GlobalPathDeformer::cb_odom, this, std::placeholders::_1));
 
+    if (scan_overlay_enabled_) {
+      sub_scan_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        scan_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&GlobalPathDeformer::cb_scan, this, std::placeholders::_1));
+    }
+
     sub_static_ = create_subscription<geometry_msgs::msg::PointStamped>(
       static_obstacle_topic_, qos,
       std::bind(&GlobalPathDeformer::cb_static, this, std::placeholders::_1));
@@ -138,8 +159,8 @@ public:
       std::chrono::milliseconds(process_period_ms_),
       std::bind(&GlobalPathDeformer::process, this));
 
-    RCLCPP_INFO(get_logger(), "global_path_deformer started. realtime_map_topic=%s, global_path_topic=%s, output_path_topic=%s",
-      realtime_map_topic_.c_str(), global_path_topic_.c_str(), output_path_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "global_path_deformer started. realtime_map_topic=%s, scan_topic=%s, global_path_topic=%s, output_path_topic=%s",
+      realtime_map_topic_.c_str(), scan_topic_.c_str(), global_path_topic_.c_str(), output_path_topic_.c_str());
   }
 
 private:
@@ -203,6 +224,50 @@ private:
     odom_frame_id_ = msg->header.frame_id;
     odom_received_ = true;
   }
+
+  void cb_scan(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    if (!scan_overlay_enabled_) return;
+
+    const int stride = std::max(1, scan_overlay_stride_);
+    std::vector<ScanObstacle> obstacles;
+    obstacles.reserve(static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height) /
+      static_cast<size_t>(stride) + 1);
+
+    try {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+      size_t index = 0;
+
+      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++index) {
+        if (index % static_cast<size_t>(stride) != 0) continue;
+
+        const double x = static_cast<double>(*iter_x);
+        const double y = static_cast<double>(*iter_y);
+        if (!std::isfinite(x) || !std::isfinite(y)) continue;
+
+        if (odom_received_) {
+          const double range = std::hypot(x - odom_x_, y - odom_y_);
+          if (range < scan_overlay_min_range_) continue;
+          if (scan_overlay_max_range_ > 0.0 && range > scan_overlay_max_range_) continue;
+        }
+
+        obstacles.push_back(ScanObstacle{x, y});
+      }
+    } catch (const std::runtime_error & e) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        2000,
+        "scan overlay PointCloud2 missing x/y float fields: %s",
+        e.what());
+      return;
+    }
+
+    scan_obstacles_ = std::move(obstacles);
+    last_scan_overlay_time_ = std::chrono::steady_clock::now();
+  }
+
   void cb_static(const geometry_msgs::msg::PointStamped::SharedPtr) {}
   void cb_dynamic(const nav_msgs::msg::Odometry::SharedPtr) {}
   void cb_flag(const geometry_msgs::msg::PointStamped::SharedPtr) {}
@@ -240,6 +305,25 @@ private:
   {
     if (cost < 0) return unknown_occupied_;
     return cost >= occupied_threshold_;
+  }
+
+  bool isMapOccupiedWorld(double x, double y) const
+  {
+    int mx = 0;
+    int my = 0;
+    if (!worldToMap(x, y, mx, my)) return false;
+    return isOccupiedCost(getCost(mx, my));
+  }
+
+  bool scanOverlayFresh() const
+  {
+    if (!scan_overlay_enabled_ || scan_obstacles_.empty() || scan_overlay_ttl_ms_ <= 0) {
+      return false;
+    }
+
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - last_scan_overlay_time_);
+    return age.count() <= scan_overlay_ttl_ms_;
   }
 
   double footprintBoundingRadius() const
@@ -286,6 +370,32 @@ private:
         if (isOccupiedCost(cost)) return true;
       }
     }
+
+    if (isScanOverlayCollision(x, y, yaw)) return true;
+
+    return false;
+  }
+
+  bool isScanOverlayCollision(double x, double y, double yaw) const
+  {
+    if (!scanOverlayFresh()) return false;
+
+    const double margin = std::max(0.0, footprint_margin_ + scan_overlay_extra_margin_);
+    const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
+    const double half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+    const double cos_yaw = std::cos(yaw);
+    const double sin_yaw = std::sin(yaw);
+
+    for (const auto & obstacle : scan_obstacles_) {
+      const double vx = obstacle.x - x;
+      const double vy = obstacle.y - y;
+      const double longitudinal = cos_yaw * vx + sin_yaw * vy;
+      const double lateral = -sin_yaw * vx + cos_yaw * vy;
+      if (std::abs(longitudinal) <= half_length && std::abs(lateral) <= half_width) {
+        return true;
+      }
+    }
+
     return false;
   }
 
@@ -677,6 +787,25 @@ private:
         }
       }
     });
+
+    if (scanOverlayFresh()) {
+      const double radius = footprintBoundingRadius() + std::max(0.0, scan_overlay_extra_margin_);
+      forEachIndexInForwardRange(is, ie, [&](int i) {
+        double nx = 0.0;
+        double ny = 0.0;
+        computeNormal(i, nx, ny);
+        if (std::hypot(nx, ny) < 1e-6) return;
+
+        for (const auto & obstacle : scan_obstacles_) {
+          if (isMapOccupiedWorld(obstacle.x, obstacle.y)) continue;
+          const double vx = obstacle.x - global_path_[i].x;
+          const double vy = obstacle.y - global_path_[i].y;
+          if (std::hypot(vx, vy) > radius) continue;
+          signed_sum += vx * nx + vy * ny;
+          ++count;
+        }
+      });
+    }
 
     if (count == 0) return 0;
     // Obstacle on +normal side means shift to -normal side.
@@ -1397,6 +1526,7 @@ private:
 private:
   std::string odom_topic_;
   std::string realtime_map_topic_;
+  std::string scan_topic_;
   std::string global_path_topic_;
   std::string output_path_topic_;
   std::string marker_topic_;
@@ -1413,6 +1543,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_map_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_path_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_scan_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_static_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_dynamic_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_flag_;
@@ -1431,6 +1562,9 @@ private:
   std::string odom_frame_id_;
   double odom_x_{0.0};
   double odom_y_{0.0};
+  std::vector<ScanObstacle> scan_obstacles_;
+  std::chrono::steady_clock::time_point last_scan_overlay_time_{
+    std::chrono::steady_clock::time_point::min()};
 
   bool map_info_logged_{false};
   uint32_t last_map_width_{0};
@@ -1460,6 +1594,12 @@ private:
   double footprint_margin_{0.10};
   int occupied_threshold_{65};
   bool unknown_occupied_{true};
+  bool scan_overlay_enabled_{true};
+  int scan_overlay_ttl_ms_{250};
+  double scan_overlay_min_range_{0.10};
+  double scan_overlay_max_range_{0.0};
+  int scan_overlay_stride_{1};
+  double scan_overlay_extra_margin_{0.05};
   int backward_waypoints_{8};
   int forward_waypoints_{20};
   int gap_tolerance_{2};

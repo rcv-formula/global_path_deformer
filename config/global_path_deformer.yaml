@@ -2,6 +2,7 @@ global_path_deformer:
   ros__parameters:
     odom_topic: /odom
     realtime_map_topic: /map
+    scan_topic: /scan_matched_points2
     static_obstacle_topic: /static_obstacle
     dynamic_obstacle_topic: /dynamic_obstacle
     obj_flag_topic: /obj_flag
@@ -15,6 +16,12 @@ global_path_deformer:
     footprint_margin: 0.10
     occupied_threshold: 65
     unknown_occupied: true
+    scan_overlay_enabled: true
+    scan_overlay_ttl_ms: 250
+    scan_overlay_min_range: 0.10
+    scan_overlay_max_range: 0.0
+    scan_overlay_stride: 1
+    scan_overlay_extra_margin: 0.05
 
     backward_waypoints: 8
     forward_waypoints: 20
@@ -23,7 +30,7 @@ global_path_deformer:
     use_full_path_search: true
     collision_search_start_ahead_waypoints: 8
     collision_search_lookahead_waypoints: 160
-    deformation_hold_cycles: 15
+    deformation_hold_cycles: 50
 
     shift_step: 0.05
     max_shift: 0.50
