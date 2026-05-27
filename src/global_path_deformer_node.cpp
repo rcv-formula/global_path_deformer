@@ -25,6 +25,7 @@
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "std_msgs/msg/int32.hpp"
 #include "visualization_msgs/msg/marker.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 struct Waypoint
 {
@@ -90,6 +91,7 @@ public:
     global_path_topic_ = declare_parameter<std::string>("global_path_topic", "/global_path");
     output_path_topic_ = declare_parameter<std::string>("output_path_topic", "/Path");
     marker_topic_ = declare_parameter<std::string>("marker_topic", "/local_path");
+    acc_marker_topic_ = declare_parameter<std::string>("acc_marker_topic", "/dynamic_acc_markers");
 
     static_obstacle_topic_ = declare_parameter<std::string>("static_obstacle_topic", "/static_obstacle");
     dynamic_obstacle_topic_ = declare_parameter<std::string>("dynamic_obstacle_topic", "/dynamic_obstacle");
@@ -103,6 +105,7 @@ public:
     mode2_dynamic_acc_enabled_ = declare_parameter<bool>("mode2_dynamic_acc_enabled", true);
     mode3_dynamic_acc_enabled_ = declare_parameter<bool>("mode3_dynamic_acc_enabled", true);
     dynamic_acc_enabled_ = declare_parameter<bool>("dynamic_acc_enabled", true);
+    dynamic_acc_marker_enabled_ = declare_parameter<bool>("dynamic_acc_marker_enabled", true);
     dynamic_acc_requires_path_window_ =
       declare_parameter<bool>("dynamic_acc_requires_path_window", true);
     dynamic_acc_path_lateral_width_ =
@@ -183,6 +186,10 @@ public:
       declare_parameter<int>("collision_search_start_ahead_waypoints", 8);
     collision_search_lookahead_waypoints_ =
       declare_parameter<int>("collision_search_lookahead_waypoints", 160);
+    dynamic_acc_search_start_ahead_waypoints_ =
+      declare_parameter<int>("dynamic_acc_search_start_ahead_waypoints", 3);
+    dynamic_acc_search_lookahead_waypoints_ =
+      declare_parameter<int>("dynamic_acc_search_lookahead_waypoints", 80);
     deformation_hold_cycles_ = declare_parameter<int>("deformation_hold_cycles", -1);
     deformation_release_cycles_ = declare_parameter<int>("deformation_release_cycles", 60);
     deformation_partial_update_grace_cycles_ =
@@ -257,6 +264,8 @@ public:
 
     pub_path_ = create_publisher<nav_msgs::msg::Path>(output_path_topic_, 1);
     marker_pub_ = create_publisher<visualization_msgs::msg::Marker>(marker_topic_, 1);
+    acc_marker_pub_ =
+      create_publisher<visualization_msgs::msg::MarkerArray>(acc_marker_topic_, 1);
 
     timer_ = create_wall_timer(
       std::chrono::milliseconds(process_period_ms_),
@@ -1098,6 +1107,28 @@ private:
     closest_index = 0;
     start = 0;
     end = last_index;
+  }
+
+  void getDynamicAccSearchRange(int closest_index, int & start, int & end) const
+  {
+    const int last_index = static_cast<int>(global_path_.size()) - 1;
+    if (global_path_.empty()) {
+      start = 0;
+      end = 0;
+      return;
+    }
+
+    const int start_ahead = std::max(0, dynamic_acc_search_start_ahead_waypoints_);
+    const int lookahead = std::max(0, dynamic_acc_search_lookahead_waypoints_);
+
+    if (closed_loop_path_) {
+      start = wrapIndex(closest_index + start_ahead);
+      end = wrapIndex(start + lookahead);
+      return;
+    }
+
+    start = std::clamp(closest_index + start_ahead, 0, last_index);
+    end = std::min(last_index, start + lookahead);
   }
 
   size_t effectiveParallelWorkers(size_t item_count) const
@@ -2198,6 +2229,95 @@ private:
     marker_pub_->publish(marker);
   }
 
+  bool isDynamicAccActivePoint(size_t index) const
+  {
+    return std::find(
+      dynamic_acc_active_point_indices_.begin(),
+      dynamic_acc_active_point_indices_.end(),
+      index) != dynamic_acc_active_point_indices_.end();
+  }
+
+  void publishDynamicAccMarkers(int search_start)
+  {
+    if (!dynamic_acc_marker_enabled_ || !acc_marker_pub_) {
+      return;
+    }
+
+    visualization_msgs::msg::MarkerArray markers;
+    visualization_msgs::msg::Marker clear;
+    clear.header.stamp = now();
+    clear.header.frame_id = path_frame_id_;
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    markers.markers.push_back(clear);
+
+    const bool fresh = dynamicPointcloudFresh();
+    const bool mode_allowed = dynamicAccAllowedByObstacleMode();
+    int id = 1;
+
+    for (size_t i = 0; i < dynamic_points_.size(); ++i) {
+      const auto & point = dynamic_points_[i];
+      const bool active = fresh && mode_allowed && isDynamicAccActivePoint(i);
+      const bool geometry_ok = dynamicPointPassesAccGeometry(point);
+
+      visualization_msgs::msg::Marker marker;
+      marker.header = clear.header;
+      marker.ns = active ? "dynamic_acc_active" : "dynamic_acc_candidates";
+      marker.id = id++;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+      marker.pose.position.x = point.x;
+      marker.pose.position.y = point.y;
+      marker.pose.position.z = active ? 0.35 : 0.25;
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = active ? 0.28 : 0.16;
+      marker.scale.y = marker.scale.x;
+      marker.scale.z = marker.scale.x;
+      marker.color.a = geometry_ok ? 0.95 : 0.35;
+      if (active) {
+        marker.color.r = 1.0;
+        marker.color.g = 0.05;
+        marker.color.b = 0.02;
+      } else {
+        marker.color.r = 0.45;
+        marker.color.g = 0.45;
+        marker.color.b = 0.45;
+      }
+      markers.markers.push_back(marker);
+    }
+
+    visualization_msgs::msg::Marker text;
+    text.header = clear.header;
+    text.ns = "dynamic_acc_status";
+    text.id = id++;
+    text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    text.action = visualization_msgs::msg::Marker::ADD;
+    text.pose.orientation.w = 1.0;
+    text.pose.position.z = 0.9;
+    if (odom_received_) {
+      text.pose.position.x = odom_x_;
+      text.pose.position.y = odom_y_;
+    } else if (!global_path_.empty()) {
+      text.pose.position.x = global_path_[wrapIndex(search_start)].x;
+      text.pose.position.y = global_path_[wrapIndex(search_start)].y;
+    }
+    text.scale.z = 0.45;
+    text.color.a = 1.0;
+    text.color.r = 0.0;
+    text.color.g = 0.0;
+    text.color.b = 0.0;
+    std::ostringstream oss;
+    oss
+      << "ACC " << (dynamic_acc_path_window_active_ ? "ON" : "OFF")
+      << " mode=" << obstacle_mode_
+      << " fresh=" << (fresh ? 1 : 0)
+      << " active_points=" << dynamic_acc_active_point_indices_.size();
+    text.text = oss.str();
+
+    markers.markers.push_back(text);
+
+    acc_marker_pub_->publish(markers);
+  }
+
   void process()
   {
     const auto process_start = std::chrono::steady_clock::now();
@@ -2228,7 +2348,10 @@ private:
     int search_start = 0;
     int search_end = static_cast<int>(global_path_.size()) - 1;
     getCollisionSearchRange(closest_index, search_start, search_end);
-    updateDynamicAccWindowState(search_start, search_end);
+    int dynamic_acc_search_start = search_start;
+    int dynamic_acc_search_end = search_end;
+    getDynamicAccSearchRange(closest_index, dynamic_acc_search_start, dynamic_acc_search_end);
+    updateDynamicAccWindowState(dynamic_acc_search_start, dynamic_acc_search_end);
 
     std::vector<int> collision_indices;
     std::vector<PathDeformation> deformations;
@@ -2352,6 +2475,7 @@ private:
     const auto corrected_path = makeCorrectedPath(deformations);
     pub_path_->publish(corrected_path);
     publishMarker(corrected_path);
+    publishDynamicAccMarkers(dynamic_acc_search_start);
     writeMetrics(
       state,
       closest_index,
@@ -2848,6 +2972,7 @@ private:
   std::string global_path_topic_;
   std::string output_path_topic_;
   std::string marker_topic_;
+  std::string acc_marker_topic_;
   std::string static_obstacle_topic_;
   std::string dynamic_obstacle_topic_;
   std::string obj_flag_topic_;
@@ -2862,6 +2987,7 @@ private:
   bool mode2_dynamic_acc_enabled_{true};
   bool mode3_dynamic_acc_enabled_{true};
   bool dynamic_acc_enabled_{true};
+  bool dynamic_acc_marker_enabled_{true};
   bool dynamic_acc_requires_path_window_{true};
   bool dynamic_acc_path_window_active_{false};
   std::vector<size_t> dynamic_acc_active_point_indices_;
@@ -2899,6 +3025,7 @@ private:
 
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr acc_marker_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   nav_msgs::msg::OccupancyGrid map_;
@@ -2989,6 +3116,8 @@ private:
   bool use_full_path_search_{true};
   int collision_search_start_ahead_waypoints_{8};
   int collision_search_lookahead_waypoints_{160};
+  int dynamic_acc_search_start_ahead_waypoints_{3};
+  int dynamic_acc_search_lookahead_waypoints_{80};
   int deformation_hold_cycles_{-1};
   int deformation_release_cycles_{60};
   int deformation_partial_update_grace_cycles_{12};

@@ -9,6 +9,7 @@ global_path_deformer:
     global_path_topic: /global_path
     output_path_topic: /Path
     marker_topic: /local_path
+    acc_marker_topic: /dynamic_acc_markers
 
     obstacle_mode_control_enabled: true
     obstacle_mode_default: 1
@@ -16,6 +17,7 @@ global_path_deformer:
     mode2_dynamic_acc_enabled: true
     mode3_dynamic_acc_enabled: true
     dynamic_acc_enabled: true
+    dynamic_acc_marker_enabled: true
     dynamic_acc_requires_path_window: true
     dynamic_acc_path_lateral_width: 0.60
     dynamic_acc_path_forward_distance: 1.00
@@ -78,14 +80,16 @@ global_path_deformer:
     closest_index_forward_search_waypoints: 45
     closest_index_reset_distance: 1.20
     use_full_path_search: false
-    collision_search_start_ahead_waypoints: 3
-    collision_search_lookahead_waypoints: 80
+    collision_search_start_ahead_waypoints: 0
+    collision_search_lookahead_waypoints: 178
+    dynamic_acc_search_start_ahead_waypoints: 3
+    dynamic_acc_search_lookahead_waypoints: 80
     deformation_hold_cycles: -1
     deformation_release_cycles: 60
     deformation_partial_update_grace_cycles: 30
     preserve_active_deformations: true
     active_deformation_hold_uses_trigger: false
-    commit_deformations_to_global_path: true
+    commit_deformations_to_global_path: false
 
     shift_step: 0.15
     max_shift: 1.5

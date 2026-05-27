@@ -12,7 +12,7 @@ def generate_launch_description():
     bag_path = LaunchConfiguration('bag_path')
     play_bag = LaunchConfiguration('play_bag')
     use_sim_time = LaunchConfiguration('use_sim_time')
-    default_bag_path = '/home/rcv/Documents/global_path_deformer/latest'
+    default_bag_path = '/home/jh/global_path_deformer/latest'
     config_file = os.path.join(
         get_package_share_directory('global_path_deformer'),
         'config',
