@@ -175,6 +175,8 @@ public:
     preserve_active_deformations_ = declare_parameter<bool>("preserve_active_deformations", true);
     active_deformation_hold_uses_trigger_ =
       declare_parameter<bool>("active_deformation_hold_uses_trigger", false);
+    commit_deformations_to_global_path_ =
+      declare_parameter<bool>("commit_deformations_to_global_path", false);
 
     shift_step_ = declare_parameter<double>("shift_step", 0.05);
     max_shift_ = declare_parameter<double>("max_shift", 0.50);
@@ -285,19 +287,22 @@ private:
     if (msg->poses.empty()) return;
 
     path_frame_id_ = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
-    global_path_.clear();
-    global_path_.reserve(msg->poses.size());
+    original_global_path_.clear();
+    original_global_path_.reserve(msg->poses.size());
 
     for (const auto & ps : msg->poses) {
       Waypoint wp;
       wp.x = ps.pose.position.x;
       wp.y = ps.pose.position.y;
       wp.v = ps.pose.position.z;  // z is velocity
-      global_path_.push_back(wp);
+      original_global_path_.push_back(wp);
     }
 
+    deformed_global_path_ = original_global_path_;
+    global_path_ = deformed_global_path_;
     path_received_ = true;
     tracked_closest_index_valid_ = false;
+    clearActiveDeformation();
 
     if (last_path_size_ != global_path_.size()) {
       last_path_size_ = global_path_.size();
@@ -1989,6 +1994,32 @@ private:
     return path;
   }
 
+  void commitDeformationsToDeformedPath(const std::vector<PathDeformation> & deformations)
+  {
+    if (!commit_deformations_to_global_path_ || deformations.empty()) {
+      return;
+    }
+
+    std::vector<Waypoint> shifted_path;
+    shifted_path.reserve(global_path_.size());
+    for (int i = 0; i < static_cast<int>(global_path_.size()); ++i) {
+      shifted_path.push_back(shiftedWaypoint(i, deformations));
+    }
+
+    if (deformed_global_path_.size() != global_path_.size()) {
+      deformed_global_path_ = global_path_;
+    }
+
+    for (size_t i = 0; i < deformed_global_path_.size(); ++i) {
+      deformed_global_path_[i].x = shifted_path[i].x;
+      deformed_global_path_[i].y = shifted_path[i].y;
+    }
+
+    global_path_ = deformed_global_path_;
+    clearActiveDeformation();
+    tracked_closest_index_valid_ = false;
+  }
+
   void publishMarker(const nav_msgs::msg::Path & path)
   {
     visualization_msgs::msg::Marker marker;
@@ -2159,6 +2190,13 @@ private:
       logClearState();
     }
 
+    std::vector<PathDeformation> metrics_deformations = deformations;
+    if (commit_deformations_to_global_path_ && state == "deforming" && !deformations.empty()) {
+      commitDeformationsToDeformedPath(deformations);
+      deformations.clear();
+      state = "committed";
+    }
+
     const auto corrected_path = makeCorrectedPath(deformations);
     pub_path_->publish(corrected_path);
     publishMarker(corrected_path);
@@ -2170,9 +2208,9 @@ private:
       search_end,
       collision_indices.size(),
       cluster_count,
-      deformations.size(),
+      metrics_deformations.size(),
       failed_clusters,
-      deformations,
+      metrics_deformations,
       failure_details,
       elapsedProcessMs(process_start));
   }
@@ -2698,6 +2736,8 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   nav_msgs::msg::OccupancyGrid map_;
+  std::vector<Waypoint> original_global_path_;
+  std::vector<Waypoint> deformed_global_path_;
   std::vector<Waypoint> global_path_;
   bool map_received_{false};
   bool path_received_{false};
@@ -2788,6 +2828,7 @@ private:
   int deformation_partial_update_grace_cycles_{12};
   bool preserve_active_deformations_{true};
   bool active_deformation_hold_uses_trigger_{false};
+  bool commit_deformations_to_global_path_{false};
   double shift_step_{0.05};
   double max_shift_{0.50};
   double minimum_deformation_shift_{0.0};

@@ -75,6 +75,7 @@ global_path_deformer:
     deformation_partial_update_grace_cycles: 30
     preserve_active_deformations: true
     active_deformation_hold_uses_trigger: false
+    commit_deformations_to_global_path: true
 
     shift_step: 0.15
     max_shift: 1.5
