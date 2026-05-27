@@ -5,11 +5,21 @@ global_path_deformer:
     scan_topic: /scan_matched_points2
     #scan_topic: /static_pointcloud
     dynamic_obstacle_topic: /dynamic_pointcloud
+    obstacle_mode_topic: /obstacle_mode
     global_path_topic: /global_path
     output_path_topic: /Path
     marker_topic: /local_path
 
+    obstacle_mode_control_enabled: true
+    obstacle_mode_default: 1
+    mode1_dynamic_acc_enabled: false
+    mode2_dynamic_acc_enabled: true
+    mode3_dynamic_acc_enabled: true
     dynamic_acc_enabled: true
+    dynamic_acc_requires_path_window: true
+    dynamic_acc_path_lateral_width: 0.60
+    dynamic_acc_path_forward_distance: 1.00
+    dynamic_acc_path_extra_margin: 0.0
     dynamic_acc_ttl_ms: 500
     dynamic_acc_front_yaw_limit: 0.60
     dynamic_acc_lateral_width: 0.60

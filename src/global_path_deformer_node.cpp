@@ -23,6 +23,7 @@
 #include "geometry_msgs/msg/point.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "std_msgs/msg/int32.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 
 struct Waypoint
@@ -93,9 +94,23 @@ public:
     static_obstacle_topic_ = declare_parameter<std::string>("static_obstacle_topic", "/static_obstacle");
     dynamic_obstacle_topic_ = declare_parameter<std::string>("dynamic_obstacle_topic", "/dynamic_obstacle");
     obj_flag_topic_ = declare_parameter<std::string>("obj_flag_topic", "/obj_flag");
+    obstacle_mode_topic_ = declare_parameter<std::string>("obstacle_mode_topic", "/obstacle_mode");
     pcd_static_obstacle_topic_ = declare_parameter<std::string>("pcd_static_obstacle_topic", "");
     latched_input_qos_ = declare_parameter<bool>("latched_input_qos", true);
+    obstacle_mode_control_enabled_ = declare_parameter<bool>("obstacle_mode_control_enabled", true);
+    obstacle_mode_ = declare_parameter<int>("obstacle_mode_default", 1);
+    mode1_dynamic_acc_enabled_ = declare_parameter<bool>("mode1_dynamic_acc_enabled", false);
+    mode2_dynamic_acc_enabled_ = declare_parameter<bool>("mode2_dynamic_acc_enabled", true);
+    mode3_dynamic_acc_enabled_ = declare_parameter<bool>("mode3_dynamic_acc_enabled", true);
     dynamic_acc_enabled_ = declare_parameter<bool>("dynamic_acc_enabled", true);
+    dynamic_acc_requires_path_window_ =
+      declare_parameter<bool>("dynamic_acc_requires_path_window", true);
+    dynamic_acc_path_lateral_width_ =
+      declare_parameter<double>("dynamic_acc_path_lateral_width", 0.60);
+    dynamic_acc_path_forward_distance_ =
+      declare_parameter<double>("dynamic_acc_path_forward_distance", 1.00);
+    dynamic_acc_path_extra_margin_ =
+      declare_parameter<double>("dynamic_acc_path_extra_margin", 0.0);
     dynamic_acc_ttl_ms_ = declare_parameter<int>("dynamic_acc_ttl_ms", 500);
     dynamic_acc_front_yaw_limit_ = declare_parameter<double>("dynamic_acc_front_yaw_limit", 0.60);
     dynamic_acc_lateral_width_ = declare_parameter<double>("dynamic_acc_lateral_width", 0.60);
@@ -231,6 +246,10 @@ public:
     sub_dynamic_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       dynamic_obstacle_topic_, scan_overlay_qos,
       std::bind(&GlobalPathDeformer::cb_dynamic, this, std::placeholders::_1));
+
+    sub_obstacle_mode_ = create_subscription<std_msgs::msg::Int32>(
+      obstacle_mode_topic_, qos,
+      std::bind(&GlobalPathDeformer::cb_obstacle_mode, this, std::placeholders::_1));
 
     sub_flag_ = create_subscription<geometry_msgs::msg::PointStamped>(
       obj_flag_topic_, qos,
@@ -421,6 +440,17 @@ private:
   }
 
   void cb_static(const geometry_msgs::msg::PointStamped::SharedPtr) {}
+  void cb_obstacle_mode(const std_msgs::msg::Int32::SharedPtr msg)
+  {
+    obstacle_mode_ = msg->data;
+    obstacle_mode_received_ = true;
+
+    RCLCPP_INFO_ONCE(
+      get_logger(),
+      "obstacle mode received: mode=%d",
+      obstacle_mode_);
+  }
+
   void cb_dynamic(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
     const std::string cloud_frame = msg->header.frame_id.empty() ? path_frame_id_ : msg->header.frame_id;
@@ -1870,40 +1900,161 @@ private:
     return age.count() <= dynamic_acc_ttl_ms_;
   }
 
-  double applyDynamicAccVelocityLimit(double nominal_speed) const
+  bool dynamicAccAllowedByObstacleMode() const
   {
-    if (nominal_speed <= 0.0 || !dynamicPointcloudFresh()) {
-      return nominal_speed;
+    if (!obstacle_mode_control_enabled_) {
+      return true;
     }
 
+    switch (obstacle_mode_) {
+      case 1:
+        return mode1_dynamic_acc_enabled_;
+      case 2:
+        return mode2_dynamic_acc_enabled_;
+      case 3:
+        return mode3_dynamic_acc_enabled_;
+      default:
+        return false;
+    }
+  }
+
+  bool dynamicPointPassesAccGeometry(const DynamicPoint & point) const
+  {
     const double yaw_limit = std::max(0.0, dynamic_acc_front_yaw_limit_);
     const double lateral_width = std::max(0.0, dynamic_acc_lateral_width_);
     const double min_distance = std::max(0.0, dynamic_acc_min_distance_);
     const double max_distance = std::max(min_distance, dynamic_acc_max_distance_);
+    const double range = point.range;
+
+    if (!std::isfinite(range) || range <= 0.0 || range > max_distance) {
+      return false;
+    }
+
+    const double bearing = std::atan2(std::sin(point.relative_yaw), std::cos(point.relative_yaw));
+    if (!std::isfinite(bearing) || !std::isfinite(point.relative_speed)) {
+      return false;
+    }
+    if (std::abs(bearing) > yaw_limit) {
+      return false;
+    }
+
+    const double lateral_offset = std::abs(std::sin(bearing) * range);
+    return lateral_width <= 0.0 || lateral_offset <= lateral_width;
+  }
+
+  double pointSegmentDistanceSquared(
+    double px,
+    double py,
+    double x0,
+    double y0,
+    double x1,
+    double y1) const
+  {
+    const double vx = x1 - x0;
+    const double vy = y1 - y0;
+    const double length2 = vx * vx + vy * vy;
+    if (length2 <= 1e-12) {
+      const double dx = px - x0;
+      const double dy = py - y0;
+      return dx * dx + dy * dy;
+    }
+
+    const double t = std::clamp(((px - x0) * vx + (py - y0) * vy) / length2, 0.0, 1.0);
+    const double cx = x0 + t * vx;
+    const double cy = y0 + t * vy;
+    const double dx = px - cx;
+    const double dy = py - cy;
+    return dx * dx + dy * dy;
+  }
+
+  bool dynamicPointNearPathWindow(const DynamicPoint & point, int start, int end) const
+  {
+    if (global_path_.empty()) {
+      return false;
+    }
+
+    bool near = false;
+    forEachIndexInForwardRange(start, end, [&](int i) {
+      if (near) {
+        return;
+      }
+
+      const Waypoint & curr = global_path_[i];
+      const double yaw = pathYawAtIndex(i);
+      const double margin = std::max(0.0, footprint_margin_ + dynamic_acc_path_extra_margin_);
+      const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
+      const double footprint_half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+      const double half_width = dynamic_acc_path_lateral_width_ > 0.0 ?
+        std::max(footprint_half_width, dynamic_acc_path_lateral_width_) :
+        footprint_half_width;
+      const double forward_limit = dynamic_acc_path_forward_distance_ > 0.0 ?
+        std::max(half_length, dynamic_acc_path_forward_distance_) :
+        half_length;
+      const double cos_yaw = std::cos(yaw);
+      const double sin_yaw = std::sin(yaw);
+      const double vx = point.x - curr.x;
+      const double vy = point.y - curr.y;
+      const double longitudinal = cos_yaw * vx + sin_yaw * vy;
+      const double lateral = -sin_yaw * vx + cos_yaw * vy;
+
+      near = longitudinal >= -half_length &&
+             longitudinal <= forward_limit &&
+             std::abs(lateral) <= half_width;
+    });
+
+    return near;
+  }
+
+  void updateDynamicAccWindowState(int search_start, int search_end)
+  {
+    dynamic_acc_path_window_active_ = false;
+    dynamic_acc_active_point_indices_.clear();
+    if (!dynamic_acc_enabled_ || !dynamicAccAllowedByObstacleMode() || !dynamicPointcloudFresh()) {
+      return;
+    }
+
+    for (size_t i = 0; i < dynamic_points_.size(); ++i) {
+      const auto & point = dynamic_points_[i];
+      if (!dynamicPointPassesAccGeometry(point)) {
+        continue;
+      }
+      if (!dynamic_acc_requires_path_window_ ||
+          dynamicPointNearPathWindow(point, search_start, search_end))
+      {
+        dynamic_acc_active_point_indices_.push_back(i);
+      }
+    }
+
+    dynamic_acc_path_window_active_ = !dynamic_acc_active_point_indices_.empty();
+  }
+
+  double applyDynamicAccVelocityLimit(double nominal_speed) const
+  {
+    if (nominal_speed <= 0.0 ||
+        !dynamic_acc_path_window_active_ ||
+        !dynamicAccAllowedByObstacleMode() ||
+        !dynamicPointcloudFresh())
+    {
+      return nominal_speed;
+    }
+
+    const double min_distance = std::max(0.0, dynamic_acc_min_distance_);
     const double time_headway = std::max(0.0, dynamic_acc_time_headway_);
     const double distance_gain = std::max(0.0, dynamic_acc_distance_gain_);
     const double min_speed = std::max(0.0, dynamic_acc_min_speed_);
     double limited_speed = nominal_speed;
 
-    for (const auto & point : dynamic_points_) {
+    for (const size_t index : dynamic_acc_active_point_indices_) {
+      if (index >= dynamic_points_.size()) {
+        continue;
+      }
+
+      const auto & point = dynamic_points_[index];
+      if (!dynamicPointPassesAccGeometry(point)) {
+        continue;
+      }
+
       const double range = point.range;
-      if (!std::isfinite(range) || range <= 0.0 || range > max_distance) {
-        continue;
-      }
-
-      const double bearing = std::atan2(std::sin(point.relative_yaw), std::cos(point.relative_yaw));
-      if (!std::isfinite(bearing) || !std::isfinite(point.relative_speed)) {
-        continue;
-      }
-      if (std::abs(bearing) > yaw_limit) {
-        continue;
-      }
-
-      const double lateral_offset = std::abs(std::sin(bearing) * range);
-      if (lateral_width > 0.0 && lateral_offset > lateral_width) {
-        continue;
-      }
-
       const double desired_distance = min_distance + time_headway * nominal_speed;
       const double distance_error = range - desired_distance;
       const double lead_speed = std::max(0.0, point.relative_speed + dynamic_acc_speed_margin_);
@@ -2077,6 +2228,7 @@ private:
     int search_start = 0;
     int search_end = static_cast<int>(global_path_.size()) - 1;
     getCollisionSearchRange(closest_index, search_start, search_end);
+    updateDynamicAccWindowState(search_start, search_end);
 
     std::vector<int> collision_indices;
     std::vector<PathDeformation> deformations;
@@ -2699,10 +2851,23 @@ private:
   std::string static_obstacle_topic_;
   std::string dynamic_obstacle_topic_;
   std::string obj_flag_topic_;
+  std::string obstacle_mode_topic_;
   std::string pcd_static_obstacle_topic_;
   bool metrics_enabled_{true};
   bool latched_input_qos_{true};
+  bool obstacle_mode_control_enabled_{true};
+  int obstacle_mode_{1};
+  bool obstacle_mode_received_{false};
+  bool mode1_dynamic_acc_enabled_{false};
+  bool mode2_dynamic_acc_enabled_{true};
+  bool mode3_dynamic_acc_enabled_{true};
   bool dynamic_acc_enabled_{true};
+  bool dynamic_acc_requires_path_window_{true};
+  bool dynamic_acc_path_window_active_{false};
+  std::vector<size_t> dynamic_acc_active_point_indices_;
+  double dynamic_acc_path_lateral_width_{0.60};
+  double dynamic_acc_path_forward_distance_{1.00};
+  double dynamic_acc_path_extra_margin_{0.0};
   int dynamic_acc_ttl_ms_{500};
   double dynamic_acc_front_yaw_limit_{0.60};
   double dynamic_acc_lateral_width_{0.60};
@@ -2728,6 +2893,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_scan_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_static_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_dynamic_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr sub_obstacle_mode_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_flag_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcd_static_cloud_;
 
