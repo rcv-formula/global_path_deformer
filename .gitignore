@@ -7,3 +7,4 @@ metrics/
 
 launch/__pycache__/
 *.csv
+latest/*.db3

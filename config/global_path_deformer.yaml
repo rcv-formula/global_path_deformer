@@ -3,41 +3,94 @@ global_path_deformer:
     odom_topic: /odom
     realtime_map_topic: /map
     scan_topic: /scan_matched_points2
-    static_obstacle_topic: /static_obstacle
-    dynamic_obstacle_topic: /dynamic_obstacle
-    obj_flag_topic: /obj_flag
+    #scan_topic: /static_pointcloud
+    dynamic_obstacle_topic: /dynamic_pointcloud
     global_path_topic: /global_path
     output_path_topic: /Path
     marker_topic: /local_path
+
+    dynamic_acc_enabled: true
+    dynamic_acc_ttl_ms: 500
+    dynamic_acc_front_yaw_limit: 0.60
+    dynamic_acc_lateral_width: 0.60
+    dynamic_acc_min_distance: 0.80
+    dynamic_acc_max_distance: 4.00
+    dynamic_acc_time_headway: 1.00
+    dynamic_acc_distance_gain: 0.80
+    dynamic_acc_speed_margin: 0.0
+    dynamic_acc_min_speed: 0.0
+    curvature_speed_limit_enabled: true
+    curvature_yaw_slowdown_start: 0.25
+    curvature_yaw_slowdown_full: 0.80
+    curvature_min_speed_scale: 0.45
+    curvature_min_speed: 0.05
 
     robot_radius: 0.14
     vehicle_width: 0.28
     vehicle_length: 0.512
     footprint_margin: 0.10
-    occupied_threshold: 65
+    map_collision_enabled: true
+    map_occupied_requires_scan_confirmation: false
+    map_occupied_scan_confirmation_radius: 0.20
+    map_trigger_enabled: true
+
+    map_trigger_extra_margin: 0.15
+    map_trigger_lateral_width: 0.35
+    map_trigger_forward_distance: 1.00
+    occupied_threshold: 40
     unknown_occupied: true
+
     scan_overlay_enabled: true
-    scan_overlay_ttl_ms: 250
-    scan_overlay_min_range: 2.0
+    scan_overlay_ttl_ms: 1200
+    scan_overlay_min_range: 0.10
     scan_overlay_max_range: 0.0
     scan_overlay_stride: 1
-    scan_overlay_extra_margin: 0.10
+    scan_overlay_index_cell_size: 0.25
+    scan_overlay_extra_margin: 0.05
+    scan_overlay_boundary_enabled: true
+    scan_overlay_trigger_enabled: true
+    scan_overlay_boundary_extra_margin: 0.05
+    scan_overlay_trigger_extra_margin: 0.12
+    scan_overlay_trigger_lateral_width: 0.35
+    scan_overlay_trigger_forward_distance: 1.00
+    scan_overlay_near_trigger_radius: 0.45
+    scan_overlay_sensor_x: 0.0
+    scan_overlay_sensor_y: 0.0
+    scan_overlay_sensor_yaw: 0.0
 
-    backward_waypoints: 8
-    forward_waypoints: 20
+    backward_waypoints: 12
+    forward_waypoints: 8
+    deformation_tail_waypoints: 8
     gap_tolerance: 2
+    max_collision_cluster_span: 8
     closed_loop_path: true
-    use_full_path_search: true
+    closest_index_backward_search_waypoints: 5
+    closest_index_forward_search_waypoints: 45
+    closest_index_reset_distance: 1.20
+    use_full_path_search: false
     collision_search_start_ahead_waypoints: 3
-    collision_search_lookahead_waypoints: 160
+    collision_search_lookahead_waypoints: 80
     deformation_hold_cycles: -1
+    deformation_release_cycles: 60
+    deformation_partial_update_grace_cycles: 30
+    preserve_active_deformations: true
+    active_deformation_hold_uses_trigger: false
 
-    shift_step: 0.05
-    max_shift: 3.0
+    shift_step: 0.15
+    max_shift: 1.5
+    minimum_deformation_shift: 0.20
+    deformation_extra_shift: 0.15
+    deformation_smoothing_alpha: 0.15
+    shift_direction_clearance_margin: 0.05
+    shift_refine_enabled: true
+    shift_refine_iterations: 3
     allow_opposite_shift: true
-    collision_check_step: 0.05
+    collision_check_step: 0.10
     process_period_ms: 20
+    parallel_enabled: true
+    parallel_threads: 4
+    parallel_min_items: 16
 
     metrics_enabled: true
-    metrics_csv_path: /home/rcv/global_path_deformer/metrics/global_path_deformer_metrics.csv
+    metrics_csv_path: /home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv
     metrics_flush_period: 20

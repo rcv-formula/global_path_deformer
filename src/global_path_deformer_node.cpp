@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -10,6 +11,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
@@ -59,6 +62,16 @@ struct ScanObstacle
   double y{0.0};
 };
 
+struct DynamicPoint
+{
+  double x{0.0};
+  double y{0.0};
+  double range{0.0};
+  uint32_t track_id{0};
+  double relative_speed{0.0};
+  double relative_yaw{0.0};
+};
+
 class GlobalPathDeformer : public rclcpp::Node
 {
 public:
@@ -67,6 +80,8 @@ public:
   {
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(10));
     const auto latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    const auto non_latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    const auto scan_overlay_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
 
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/odom");
     realtime_map_topic_ = declare_parameter<std::string>("realtime_map_topic", "/map");
@@ -79,11 +94,38 @@ public:
     dynamic_obstacle_topic_ = declare_parameter<std::string>("dynamic_obstacle_topic", "/dynamic_obstacle");
     obj_flag_topic_ = declare_parameter<std::string>("obj_flag_topic", "/obj_flag");
     pcd_static_obstacle_topic_ = declare_parameter<std::string>("pcd_static_obstacle_topic", "");
+    latched_input_qos_ = declare_parameter<bool>("latched_input_qos", true);
+    dynamic_acc_enabled_ = declare_parameter<bool>("dynamic_acc_enabled", true);
+    dynamic_acc_ttl_ms_ = declare_parameter<int>("dynamic_acc_ttl_ms", 500);
+    dynamic_acc_front_yaw_limit_ = declare_parameter<double>("dynamic_acc_front_yaw_limit", 0.60);
+    dynamic_acc_lateral_width_ = declare_parameter<double>("dynamic_acc_lateral_width", 0.60);
+    dynamic_acc_min_distance_ = declare_parameter<double>("dynamic_acc_min_distance", 0.80);
+    dynamic_acc_max_distance_ = declare_parameter<double>("dynamic_acc_max_distance", 4.00);
+    dynamic_acc_time_headway_ = declare_parameter<double>("dynamic_acc_time_headway", 1.00);
+    dynamic_acc_distance_gain_ = declare_parameter<double>("dynamic_acc_distance_gain", 0.80);
+    dynamic_acc_speed_margin_ = declare_parameter<double>("dynamic_acc_speed_margin", 0.0);
+    dynamic_acc_min_speed_ = declare_parameter<double>("dynamic_acc_min_speed", 0.0);
+    curvature_speed_limit_enabled_ = declare_parameter<bool>("curvature_speed_limit_enabled", true);
+    curvature_yaw_slowdown_start_ =
+      declare_parameter<double>("curvature_yaw_slowdown_start", 0.25);
+    curvature_yaw_slowdown_full_ =
+      declare_parameter<double>("curvature_yaw_slowdown_full", 0.80);
+    curvature_min_speed_scale_ = declare_parameter<double>("curvature_min_speed_scale", 0.45);
+    curvature_min_speed_ = declare_parameter<double>("curvature_min_speed", 0.05);
 
     robot_radius_ = declare_parameter<double>("robot_radius", 0.14);
     vehicle_width_ = declare_parameter<double>("vehicle_width", 0.28);
     vehicle_length_ = declare_parameter<double>("vehicle_length", 0.512);
     footprint_margin_ = declare_parameter<double>("footprint_margin", 0.10);
+    map_collision_enabled_ = declare_parameter<bool>("map_collision_enabled", true);
+    map_occupied_requires_scan_confirmation_ =
+      declare_parameter<bool>("map_occupied_requires_scan_confirmation", false);
+    map_occupied_scan_confirmation_radius_ =
+      declare_parameter<double>("map_occupied_scan_confirmation_radius", 0.20);
+    map_trigger_enabled_ = declare_parameter<bool>("map_trigger_enabled", true);
+    map_trigger_extra_margin_ = declare_parameter<double>("map_trigger_extra_margin", 0.15);
+    map_trigger_lateral_width_ = declare_parameter<double>("map_trigger_lateral_width", 0.50);
+    map_trigger_forward_distance_ = declare_parameter<double>("map_trigger_forward_distance", 1.20);
     occupied_threshold_ = declare_parameter<int>("occupied_threshold", 65);
     unknown_occupied_ = declare_parameter<bool>("unknown_occupied", true);
     scan_overlay_enabled_ = declare_parameter<bool>("scan_overlay_enabled", true);
@@ -91,24 +133,64 @@ public:
     scan_overlay_min_range_ = declare_parameter<double>("scan_overlay_min_range", 0.10);
     scan_overlay_max_range_ = declare_parameter<double>("scan_overlay_max_range", 0.0);
     scan_overlay_stride_ = declare_parameter<int>("scan_overlay_stride", 1);
+    scan_overlay_index_cell_size_ = declare_parameter<double>("scan_overlay_index_cell_size", 0.25);
     scan_overlay_extra_margin_ = declare_parameter<double>("scan_overlay_extra_margin", 0.05);
+    scan_overlay_boundary_enabled_ = declare_parameter<bool>("scan_overlay_boundary_enabled", true);
+    scan_overlay_trigger_enabled_ = declare_parameter<bool>("scan_overlay_trigger_enabled", true);
+    scan_overlay_boundary_extra_margin_ =
+      declare_parameter<double>("scan_overlay_boundary_extra_margin", scan_overlay_extra_margin_);
+    scan_overlay_trigger_extra_margin_ =
+      declare_parameter<double>("scan_overlay_trigger_extra_margin", scan_overlay_extra_margin_);
+    scan_overlay_trigger_lateral_width_ =
+      declare_parameter<double>("scan_overlay_trigger_lateral_width", 0.0);
+    scan_overlay_trigger_forward_distance_ =
+      declare_parameter<double>("scan_overlay_trigger_forward_distance", 0.0);
+    scan_overlay_near_trigger_radius_ =
+      declare_parameter<double>("scan_overlay_near_trigger_radius", 0.0);
+    scan_overlay_sensor_x_ = declare_parameter<double>("scan_overlay_sensor_x", 0.0);
+    scan_overlay_sensor_y_ = declare_parameter<double>("scan_overlay_sensor_y", 0.0);
+    scan_overlay_sensor_yaw_ = declare_parameter<double>("scan_overlay_sensor_yaw", 0.0);
 
     backward_waypoints_ = declare_parameter<int>("backward_waypoints", 8);
     forward_waypoints_ = declare_parameter<int>("forward_waypoints", 20);
+    deformation_tail_waypoints_ = declare_parameter<int>("deformation_tail_waypoints", 0);
     gap_tolerance_ = declare_parameter<int>("gap_tolerance", 2);
+    max_collision_cluster_span_ = declare_parameter<int>("max_collision_cluster_span", 0);
     closed_loop_path_ = declare_parameter<bool>("closed_loop_path", true);
+    closest_index_backward_search_waypoints_ =
+      declare_parameter<int>("closest_index_backward_search_waypoints", 5);
+    closest_index_forward_search_waypoints_ =
+      declare_parameter<int>("closest_index_forward_search_waypoints", 45);
+    closest_index_reset_distance_ =
+      declare_parameter<double>("closest_index_reset_distance", 1.20);
     use_full_path_search_ = declare_parameter<bool>("use_full_path_search", true);
     collision_search_start_ahead_waypoints_ =
       declare_parameter<int>("collision_search_start_ahead_waypoints", 8);
     collision_search_lookahead_waypoints_ =
       declare_parameter<int>("collision_search_lookahead_waypoints", 160);
     deformation_hold_cycles_ = declare_parameter<int>("deformation_hold_cycles", -1);
+    deformation_release_cycles_ = declare_parameter<int>("deformation_release_cycles", 60);
+    deformation_partial_update_grace_cycles_ =
+      declare_parameter<int>("deformation_partial_update_grace_cycles", 12);
+    preserve_active_deformations_ = declare_parameter<bool>("preserve_active_deformations", true);
+    active_deformation_hold_uses_trigger_ =
+      declare_parameter<bool>("active_deformation_hold_uses_trigger", false);
 
     shift_step_ = declare_parameter<double>("shift_step", 0.05);
     max_shift_ = declare_parameter<double>("max_shift", 0.50);
+    minimum_deformation_shift_ = declare_parameter<double>("minimum_deformation_shift", 0.0);
+    deformation_extra_shift_ = declare_parameter<double>("deformation_extra_shift", 0.0);
+    deformation_smoothing_alpha_ = declare_parameter<double>("deformation_smoothing_alpha", 0.35);
+    shift_direction_clearance_margin_ =
+      declare_parameter<double>("shift_direction_clearance_margin", 0.05);
+    shift_refine_enabled_ = declare_parameter<bool>("shift_refine_enabled", true);
+    shift_refine_iterations_ = declare_parameter<int>("shift_refine_iterations", 5);
     allow_opposite_shift_ = declare_parameter<bool>("allow_opposite_shift", true);
     process_period_ms_ = declare_parameter<int>("process_period_ms", 20);
     collision_check_step_ = declare_parameter<double>("collision_check_step", 0.0);
+    parallel_enabled_ = declare_parameter<bool>("parallel_enabled", true);
+    parallel_threads_ = declare_parameter<int>("parallel_threads", 0);
+    parallel_min_items_ = declare_parameter<int>("parallel_min_items", 16);
     metrics_enabled_ = declare_parameter<bool>("metrics_enabled", true);
     metrics_csv_path_ = declare_parameter<std::string>(
       "metrics_csv_path",
@@ -117,11 +199,11 @@ public:
     openMetricsFile();
 
     sub_map_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-      realtime_map_topic_, latched_qos,
+      realtime_map_topic_, latched_input_qos_ ? latched_qos : non_latched_qos,
       std::bind(&GlobalPathDeformer::cb_map, this, std::placeholders::_1));
 
     sub_path_ = create_subscription<nav_msgs::msg::Path>(
-      global_path_topic_, latched_qos,
+      global_path_topic_, latched_input_qos_ ? latched_qos : non_latched_qos,
       std::bind(&GlobalPathDeformer::cb_path, this, std::placeholders::_1));
 
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -130,7 +212,7 @@ public:
 
     if (scan_overlay_enabled_) {
       sub_scan_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        scan_topic_, rclcpp::SensorDataQoS(),
+        scan_topic_, scan_overlay_qos,
         std::bind(&GlobalPathDeformer::cb_scan, this, std::placeholders::_1));
     }
 
@@ -144,8 +226,8 @@ public:
         std::bind(&GlobalPathDeformer::cb_pcd_static_cloud, this, std::placeholders::_1));
     }
 
-    sub_dynamic_ = create_subscription<nav_msgs::msg::Odometry>(
-      dynamic_obstacle_topic_, qos,
+    sub_dynamic_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      dynamic_obstacle_topic_, scan_overlay_qos,
       std::bind(&GlobalPathDeformer::cb_dynamic, this, std::placeholders::_1));
 
     sub_flag_ = create_subscription<geometry_msgs::msg::PointStamped>(
@@ -159,8 +241,17 @@ public:
       std::chrono::milliseconds(process_period_ms_),
       std::bind(&GlobalPathDeformer::process, this));
 
-    RCLCPP_INFO(get_logger(), "global_path_deformer started. realtime_map_topic=%s, scan_topic=%s, global_path_topic=%s, output_path_topic=%s",
-      realtime_map_topic_.c_str(), scan_topic_.c_str(), global_path_topic_.c_str(), output_path_topic_.c_str());
+    RCLCPP_INFO(
+      get_logger(),
+      "global_path_deformer started. realtime_map_topic=%s, scan_topic=%s, scan_qos=best_effort, global_path_topic=%s, output_path_topic=%s, scan_boundary_margin=%.3f, scan_trigger_margin=%.3f, scan_trigger_lateral_width=%.3f, scan_trigger_forward_distance=%.3f",
+      realtime_map_topic_.c_str(),
+      scan_topic_.c_str(),
+      global_path_topic_.c_str(),
+      output_path_topic_.c_str(),
+      scan_overlay_boundary_extra_margin_,
+      scan_overlay_trigger_extra_margin_,
+      scan_overlay_trigger_lateral_width_,
+      scan_overlay_trigger_forward_distance_);
   }
 
 private:
@@ -206,6 +297,7 @@ private:
     }
 
     path_received_ = true;
+    tracked_closest_index_valid_ = false;
 
     if (last_path_size_ != global_path_.size()) {
       last_path_size_ = global_path_.size();
@@ -221,8 +313,41 @@ private:
   {
     odom_x_ = msg->pose.pose.position.x;
     odom_y_ = msg->pose.pose.position.y;
+    const auto & q = msg->pose.pose.orientation;
+    const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+    const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+    odom_yaw_ = std::atan2(siny_cosp, cosy_cosp);
     odom_frame_id_ = msg->header.frame_id;
     odom_received_ = true;
+  }
+
+  bool transformPointToPathFrame(
+    double x,
+    double y,
+    const std::string & cloud_frame,
+    double & world_x,
+    double & world_y) const
+  {
+    const std::string path_frame = path_frame_id_.empty() ? "map" : path_frame_id_;
+    if (cloud_frame.empty() || cloud_frame == path_frame) {
+      world_x = x;
+      world_y = y;
+      return true;
+    }
+
+    if (!odom_received_) {
+      return false;
+    }
+
+    const double cos_odom = std::cos(odom_yaw_);
+    const double sin_odom = std::sin(odom_yaw_);
+    const double cos_sensor = std::cos(scan_overlay_sensor_yaw_);
+    const double sin_sensor = std::sin(scan_overlay_sensor_yaw_);
+    const double base_x = scan_overlay_sensor_x_ + cos_sensor * x - sin_sensor * y;
+    const double base_y = scan_overlay_sensor_y_ + sin_sensor * x + cos_sensor * y;
+    world_x = odom_x_ + cos_odom * base_x - sin_odom * base_y;
+    world_y = odom_y_ + sin_odom * base_x + cos_odom * base_y;
+    return true;
   }
 
   void cb_scan(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
@@ -233,6 +358,10 @@ private:
     std::vector<ScanObstacle> obstacles;
     obstacles.reserve(static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height) /
       static_cast<size_t>(stride) + 1);
+    const std::string cloud_frame = msg->header.frame_id.empty() ? path_frame_id_ : msg->header.frame_id;
+    const std::string path_frame = path_frame_id_.empty() ? "map" : path_frame_id_;
+    const bool cloud_in_path_frame = cloud_frame == path_frame;
+    const bool can_transform_from_robot_frame = cloud_in_path_frame || odom_received_;
 
     try {
       sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
@@ -246,13 +375,19 @@ private:
         const double y = static_cast<double>(*iter_y);
         if (!std::isfinite(x) || !std::isfinite(y)) continue;
 
+        double world_x = x;
+        double world_y = y;
+        if (!transformPointToPathFrame(x, y, cloud_frame, world_x, world_y)) {
+          continue;
+        }
+
         if (odom_received_) {
-          const double range = std::hypot(x - odom_x_, y - odom_y_);
+          const double range = std::hypot(world_x - odom_x_, world_y - odom_y_);
           if (range < scan_overlay_min_range_) continue;
           if (scan_overlay_max_range_ > 0.0 && range > scan_overlay_max_range_) continue;
         }
 
-        obstacles.push_back(ScanObstacle{x, y});
+        obstacles.push_back(ScanObstacle{world_x, world_y});
       }
     } catch (const std::runtime_error & e) {
       RCLCPP_WARN_THROTTLE(
@@ -265,11 +400,84 @@ private:
     }
 
     scan_obstacles_ = std::move(obstacles);
+    rebuildScanObstacleIndex();
     last_scan_overlay_time_ = std::chrono::steady_clock::now();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      2000,
+      "scan overlay received: topic=%s frame=%s path_frame=%s transform=%s input_points=%zu used_points=%zu",
+      scan_topic_.c_str(),
+      cloud_frame.c_str(),
+      path_frame.c_str(),
+      cloud_in_path_frame ? "none" : (can_transform_from_robot_frame ? "odom" : "dropped_no_odom"),
+      static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height),
+      scan_obstacles_.size());
   }
 
   void cb_static(const geometry_msgs::msg::PointStamped::SharedPtr) {}
-  void cb_dynamic(const nav_msgs::msg::Odometry::SharedPtr) {}
+  void cb_dynamic(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  {
+    const std::string cloud_frame = msg->header.frame_id.empty() ? path_frame_id_ : msg->header.frame_id;
+    const std::string path_frame = path_frame_id_.empty() ? "map" : path_frame_id_;
+    const bool cloud_in_path_frame = cloud_frame == path_frame;
+    const bool can_transform_from_robot_frame = cloud_in_path_frame || odom_received_;
+    std::vector<DynamicPoint> dynamic_points;
+    dynamic_points.reserve(static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height));
+
+    try {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+      sensor_msgs::PointCloud2ConstIterator<uint32_t> iter_track_id(*msg, "track_id");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_speed(*msg, "relative_speed");
+      sensor_msgs::PointCloud2ConstIterator<float> iter_yaw(*msg, "relative_yaw");
+
+      for (;
+        iter_x != iter_x.end();
+        ++iter_x, ++iter_y, ++iter_track_id, ++iter_speed, ++iter_yaw)
+      {
+        const double x = static_cast<double>(*iter_x);
+        const double y = static_cast<double>(*iter_y);
+        if (!std::isfinite(x) || !std::isfinite(y)) continue;
+
+        double world_x = x;
+        double world_y = y;
+        if (!transformPointToPathFrame(x, y, cloud_frame, world_x, world_y)) {
+          continue;
+        }
+
+        dynamic_points.push_back(DynamicPoint{
+          world_x,
+          world_y,
+          std::hypot(x, y),
+          *iter_track_id,
+          static_cast<double>(*iter_speed),
+          static_cast<double>(*iter_yaw)});
+      }
+    } catch (const std::runtime_error & e) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        2000,
+        "dynamic PointCloud2 missing expected fields x/y/track_id/relative_speed/relative_yaw: %s",
+        e.what());
+      return;
+    }
+
+    dynamic_points_ = std::move(dynamic_points);
+    last_dynamic_pointcloud_time_ = std::chrono::steady_clock::now();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      2000,
+      "dynamic pointcloud received: topic=%s frame=%s path_frame=%s transform=%s input_points=%zu used_points=%zu",
+      dynamic_obstacle_topic_.c_str(),
+      cloud_frame.c_str(),
+      path_frame.c_str(),
+      cloud_in_path_frame ? "none" : (can_transform_from_robot_frame ? "odom" : "dropped_no_odom"),
+      static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height),
+      dynamic_points_.size());
+  }
   void cb_flag(const geometry_msgs::msg::PointStamped::SharedPtr) {}
   void cb_pcd_static_cloud(const sensor_msgs::msg::PointCloud2::SharedPtr) {}
 
@@ -309,6 +517,7 @@ private:
 
   bool isMapOccupiedWorld(double x, double y) const
   {
+    if (!map_collision_enabled_) return false;
     int mx = 0;
     int my = 0;
     if (!worldToMap(x, y, mx, my)) return false;
@@ -326,6 +535,66 @@ private:
     return age.count() <= scan_overlay_ttl_ms_;
   }
 
+  int scanObstacleCell(double value) const
+  {
+    const double cell_size = std::max(0.05, scan_overlay_index_cell_size_);
+    return static_cast<int>(std::floor(value / cell_size));
+  }
+
+  int64_t scanObstacleCellKey(int cx, int cy) const
+  {
+    return (static_cast<int64_t>(cx) << 32) ^
+           static_cast<int64_t>(static_cast<uint32_t>(cy));
+  }
+
+  void rebuildScanObstacleIndex()
+  {
+    scan_obstacle_index_.clear();
+    scan_obstacle_index_.reserve(scan_obstacles_.size() * 2 + 1);
+    for (size_t i = 0; i < scan_obstacles_.size(); ++i) {
+      const auto & obstacle = scan_obstacles_[i];
+      const int cx = scanObstacleCell(obstacle.x);
+      const int cy = scanObstacleCell(obstacle.y);
+      scan_obstacle_index_[scanObstacleCellKey(cx, cy)].push_back(i);
+    }
+  }
+
+  template<typename Callback>
+  bool anyScanObstacleNear(double x, double y, double radius, Callback cb) const
+  {
+    if (scan_obstacles_.empty()) return false;
+    if (scan_obstacle_index_.empty()) {
+      for (const auto & obstacle : scan_obstacles_) {
+        if (cb(obstacle)) return true;
+      }
+      return false;
+    }
+
+    const double cell_size = std::max(0.05, scan_overlay_index_cell_size_);
+    const int center_x = scanObstacleCell(x);
+    const int center_y = scanObstacleCell(y);
+    const int cell_radius = std::max(0, static_cast<int>(std::ceil(radius / cell_size)));
+    const double radius2 = std::max(0.0, radius) * std::max(0.0, radius);
+
+    for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
+      for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
+        const auto it = scan_obstacle_index_.find(
+          scanObstacleCellKey(center_x + dx, center_y + dy));
+        if (it == scan_obstacle_index_.end()) continue;
+        for (const size_t index : it->second) {
+          if (index >= scan_obstacles_.size()) continue;
+          const auto & obstacle = scan_obstacles_[index];
+          const double ox = obstacle.x - x;
+          const double oy = obstacle.y - y;
+          if (ox * ox + oy * oy > radius2) continue;
+          if (cb(obstacle)) return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
   double footprintBoundingRadius() const
   {
     const double margin = std::max(0.0, footprint_margin_);
@@ -334,9 +603,21 @@ private:
     return std::hypot(half_length, half_width);
   }
 
+  bool scanConfirmsMapOccupied(double x, double y) const
+  {
+    if (!map_occupied_requires_scan_confirmation_) return true;
+    if (!scanOverlayFresh()) return true;
+
+    const double radius = std::max(0.0, map_occupied_scan_confirmation_radius_);
+    return anyScanObstacleNear(x, y, radius, [](const ScanObstacle &) {
+      return true;
+    });
+  }
+
   bool isFootprintCollision(double x, double y, double yaw) const
   {
-    if (isScanOverlayCollision(x, y, yaw)) return true;
+    if (isScanBoundaryCollision(x, y, yaw)) return true;
+    if (!map_collision_enabled_) return false;
 
     int mx = 0;
     int my = 0;
@@ -376,27 +657,166 @@ private:
     return false;
   }
 
-  bool isScanOverlayCollision(double x, double y, double yaw) const
+  bool scanObstacleInLocalBox(
+    const ScanObstacle & obstacle,
+    double x,
+    double y,
+    double yaw,
+    double extra_margin,
+    double trigger_forward_distance,
+    double trigger_lateral_width) const
   {
-    if (!scanOverlayFresh()) return false;
-
-    const double margin = std::max(0.0, footprint_margin_ + scan_overlay_extra_margin_);
+    const double margin = std::max(0.0, footprint_margin_ + extra_margin);
     const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
-    const double half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+    const double footprint_half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+    const double half_width = trigger_lateral_width > 0.0 ?
+      std::max(footprint_half_width, trigger_lateral_width) :
+      footprint_half_width;
+    const double forward_limit = trigger_forward_distance > 0.0 ?
+      std::max(half_length, trigger_forward_distance) :
+      half_length;
     const double cos_yaw = std::cos(yaw);
     const double sin_yaw = std::sin(yaw);
 
-    for (const auto & obstacle : scan_obstacles_) {
-      const double vx = obstacle.x - x;
-      const double vy = obstacle.y - y;
-      const double longitudinal = cos_yaw * vx + sin_yaw * vy;
-      const double lateral = -sin_yaw * vx + cos_yaw * vy;
-      if (std::abs(longitudinal) <= half_length && std::abs(lateral) <= half_width) {
-        return true;
+    const double vx = obstacle.x - x;
+    const double vy = obstacle.y - y;
+    const double longitudinal = cos_yaw * vx + sin_yaw * vy;
+    const double lateral = -sin_yaw * vx + cos_yaw * vy;
+    return longitudinal >= -half_length &&
+           longitudinal <= forward_limit &&
+           std::abs(lateral) <= half_width;
+  }
+
+  bool scanObstacleNearPathPoint(const ScanObstacle & obstacle, double x, double y) const
+  {
+    if (scan_overlay_near_trigger_radius_ <= 0.0) return false;
+
+    const double radius = scan_overlay_near_trigger_radius_;
+    const double dx = obstacle.x - x;
+    const double dy = obstacle.y - y;
+    return dx * dx + dy * dy <= radius * radius;
+  }
+
+  bool isScanBoundaryCollision(double x, double y, double yaw) const
+  {
+    if (!scan_overlay_boundary_enabled_ || !scanOverlayFresh()) return false;
+
+    const double query_radius = footprintBoundingRadius() +
+      std::max(0.0, scan_overlay_boundary_extra_margin_);
+    return anyScanObstacleNear(
+      x,
+      y,
+      query_radius,
+      [&](const ScanObstacle & obstacle) {
+        return scanObstacleInLocalBox(
+          obstacle,
+          x,
+          y,
+          yaw,
+          scan_overlay_boundary_extra_margin_,
+          0.0,
+          0.0);
+      });
+  }
+
+  bool isScanTriggerCollision(double x, double y, double yaw) const
+  {
+    if (!scan_overlay_trigger_enabled_ || !scanOverlayFresh()) return false;
+
+    const double margin = std::max(0.0, footprint_margin_ + scan_overlay_trigger_extra_margin_);
+    const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
+    const double footprint_half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+    const double half_width = scan_overlay_trigger_lateral_width_ > 0.0 ?
+      std::max(footprint_half_width, scan_overlay_trigger_lateral_width_) :
+      footprint_half_width;
+    const double forward_limit = scan_overlay_trigger_forward_distance_ > 0.0 ?
+      std::max(half_length, scan_overlay_trigger_forward_distance_) :
+      half_length;
+    const double query_radius = std::max(
+      std::max(0.0, scan_overlay_near_trigger_radius_),
+      std::hypot(std::max(half_length, forward_limit), half_width));
+
+    return anyScanObstacleNear(
+      x,
+      y,
+      query_radius,
+      [&](const ScanObstacle & obstacle) {
+        if (scanObstacleNearPathPoint(obstacle, x, y)) return true;
+        return scanObstacleInLocalBox(
+          obstacle,
+          x,
+          y,
+          yaw,
+          scan_overlay_trigger_extra_margin_,
+          scan_overlay_trigger_forward_distance_,
+          scan_overlay_trigger_lateral_width_);
+      });
+  }
+
+  bool isMapTriggerCollision(double x, double y, double yaw) const
+  {
+    if (!map_collision_enabled_ || !map_trigger_enabled_ || !map_received_) return false;
+
+    int mx = 0;
+    int my = 0;
+    if (!worldToMap(x, y, mx, my)) return false;
+
+    const double res = map_.info.resolution;
+    if (res <= 0.0) return false;
+
+    const double margin = std::max(0.0, footprint_margin_ + map_trigger_extra_margin_);
+    const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
+    const double footprint_half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+    const double half_width = map_trigger_lateral_width_ > 0.0 ?
+      std::max(footprint_half_width, map_trigger_lateral_width_) :
+      footprint_half_width;
+    const double forward_limit = map_trigger_forward_distance_ > 0.0 ?
+      std::max(half_length, map_trigger_forward_distance_) :
+      half_length;
+    const double search_radius = std::hypot(forward_limit, half_width);
+    const int r_cell = static_cast<int>(std::ceil(search_radius / res));
+    const double cos_yaw = std::cos(yaw);
+    const double sin_yaw = std::sin(yaw);
+
+    for (int dx = -r_cell; dx <= r_cell; ++dx) {
+      for (int dy = -r_cell; dy <= r_cell; ++dy) {
+        const int cell_mx = mx + dx;
+        const int cell_my = my + dy;
+        if (cell_mx < 0 || cell_my < 0 ||
+            cell_mx >= static_cast<int>(map_.info.width) ||
+            cell_my >= static_cast<int>(map_.info.height)) {
+          continue;
+        }
+
+        const int cost = getCost(cell_mx, cell_my);
+        if (!isOccupiedCost(cost)) continue;
+
+        const double cell_x = map_.info.origin.position.x +
+          (static_cast<double>(cell_mx) + 0.5) * res;
+        const double cell_y = map_.info.origin.position.y +
+          (static_cast<double>(cell_my) + 0.5) * res;
+        if (!scanConfirmsMapOccupied(cell_x, cell_y)) continue;
+
+        const double vx = cell_x - x;
+        const double vy = cell_y - y;
+        const double longitudinal = cos_yaw * vx + sin_yaw * vy;
+        const double lateral = -sin_yaw * vx + cos_yaw * vy;
+        if (longitudinal >= -half_length &&
+            longitudinal <= forward_limit &&
+            std::abs(lateral) <= half_width) {
+          return true;
+        }
       }
     }
 
     return false;
+  }
+
+  bool isDeformationTriggerCollision(double x, double y, double yaw) const
+  {
+    if (isScanTriggerCollision(x, y, yaw)) return true;
+    if (isMapTriggerCollision(x, y, yaw)) return true;
+    return isFootprintCollision(x, y, yaw);
   }
 
   double pathYawAtIndex(int i) const
@@ -503,7 +923,12 @@ private:
     return wp;
   }
 
-  bool segmentCollision(double x0, double y0, double x1, double y1) const
+  bool segmentCollision(
+    double x0,
+    double y0,
+    double x1,
+    double y1,
+    bool use_deformation_trigger = false) const
   {
     const double length = std::hypot(x1 - x0, y1 - y0);
     const int steps = std::max(1, static_cast<int>(std::ceil(length / effectiveCollisionCheckStep())));
@@ -513,13 +938,24 @@ private:
       const double t = static_cast<double>(k) / static_cast<double>(steps);
       const double x = x0 + t * (x1 - x0);
       const double y = y0 + t * (y1 - y0);
-      if (isFootprintCollision(x, y, yaw)) return true;
+      if (use_deformation_trigger) {
+        if (isDeformationTriggerCollision(x, y, yaw)) return true;
+      } else if (isFootprintCollision(x, y, yaw)) {
+        return true;
+      }
     }
 
     return false;
   }
 
-  int getClosestPathIndex() const
+  double pathDistanceSquaredToOdom(int index) const
+  {
+    const double dx = global_path_[index].x - odom_x_;
+    const double dy = global_path_[index].y - odom_y_;
+    return dx * dx + dy * dy;
+  }
+
+  int getClosestPathIndexFull() const
   {
     if (!odom_received_ || global_path_.empty()) return 0;
 
@@ -527,9 +963,7 @@ private:
     double best_dist2 = std::numeric_limits<double>::infinity();
 
     for (int i = 0; i < static_cast<int>(global_path_.size()); ++i) {
-      const double dx = global_path_[i].x - odom_x_;
-      const double dy = global_path_[i].y - odom_y_;
-      const double dist2 = dx * dx + dy * dy;
+      const double dist2 = pathDistanceSquaredToOdom(i);
       if (dist2 < best_dist2) {
         best_dist2 = dist2;
         best_index = i;
@@ -539,18 +973,75 @@ private:
     return best_index;
   }
 
+  int getClosestPathIndex()
+  {
+    if (!odom_received_ || global_path_.empty()) return 0;
+
+    if (!tracked_closest_index_valid_ ||
+        tracked_closest_path_size_ != global_path_.size()) {
+      tracked_closest_index_ = getClosestPathIndexFull();
+      tracked_closest_path_size_ = global_path_.size();
+      tracked_closest_index_valid_ = true;
+      return tracked_closest_index_;
+    }
+
+    int best_index = tracked_closest_index_;
+    double best_dist2 = pathDistanceSquaredToOdom(best_index);
+    const int backward = std::max(0, closest_index_backward_search_waypoints_);
+    const int forward = std::max(1, closest_index_forward_search_waypoints_);
+
+    if (closed_loop_path_) {
+      const int start = wrapIndex(tracked_closest_index_ - backward);
+      const int end = wrapIndex(tracked_closest_index_ + forward);
+      forEachIndexInForwardRange(start, end, [&](int i) {
+        const double dist2 = pathDistanceSquaredToOdom(i);
+        if (dist2 < best_dist2) {
+          best_dist2 = dist2;
+          best_index = i;
+        }
+      });
+    } else {
+      const int start = std::max(0, tracked_closest_index_ - backward);
+      const int end = std::min(
+        static_cast<int>(global_path_.size()) - 1,
+        tracked_closest_index_ + forward);
+      for (int i = start; i <= end; ++i) {
+        const double dist2 = pathDistanceSquaredToOdom(i);
+        if (dist2 < best_dist2) {
+          best_dist2 = dist2;
+          best_index = i;
+        }
+      }
+    }
+
+    const double reset_distance = std::max(0.0, closest_index_reset_distance_);
+    if (reset_distance > 0.0 && best_dist2 > reset_distance * reset_distance) {
+      best_index = getClosestPathIndexFull();
+    }
+
+    tracked_closest_index_ = best_index;
+    tracked_closest_path_size_ = global_path_.size();
+    tracked_closest_index_valid_ = true;
+    return tracked_closest_index_;
+  }
+
   int getUpcomingPathIndex(int closest_index) const
   {
     if (global_path_.empty()) return 0;
 
     const int last_index = static_cast<int>(global_path_.size()) - 1;
+    const int start_ahead = std::max(0, collision_search_start_ahead_waypoints_);
+    if (closed_loop_path_) {
+      return wrapIndex(closest_index + start_ahead);
+    }
+
     return std::clamp(
-      closest_index + collision_search_start_ahead_waypoints_,
+      closest_index + start_ahead,
       0,
       last_index);
   }
 
-  void getCollisionSearchRange(int & closest_index, int & start, int & end) const
+  void getCollisionSearchRange(int & closest_index, int & start, int & end)
   {
     const int last_index = static_cast<int>(global_path_.size()) - 1;
     if (use_full_path_search_) {
@@ -563,7 +1054,9 @@ private:
     if (odom_received_) {
       closest_index = std::clamp(getClosestPathIndex(), 0, last_index);
       start = getUpcomingPathIndex(closest_index);
-      end = std::min(last_index, start + collision_search_lookahead_waypoints_);
+      end = closed_loop_path_ ?
+        wrapIndex(start + collision_search_lookahead_waypoints_) :
+        std::min(last_index, start + collision_search_lookahead_waypoints_);
       return;
     }
 
@@ -572,47 +1065,123 @@ private:
     end = last_index;
   }
 
+  size_t effectiveParallelWorkers(size_t item_count) const
+  {
+    if (item_count == 0) {
+      return 0;
+    }
+    if (!parallel_enabled_ || item_count < static_cast<size_t>(std::max(1, parallel_min_items_))) {
+      return 1;
+    }
+
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    const size_t configured_threads = parallel_threads_ > 0 ?
+      static_cast<size_t>(parallel_threads_) :
+      static_cast<size_t>(std::max(1u, hardware_threads));
+    return std::clamp(configured_threads, static_cast<size_t>(1), item_count);
+  }
+
+  template<typename Fn>
+  size_t parallelForRanges(size_t item_count, Fn && fn) const
+  {
+    const size_t workers = effectiveParallelWorkers(item_count);
+    if (workers == 0) {
+      return 0;
+    }
+    if (workers <= 1) {
+      fn(0, item_count, 0);
+      return 1;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (size_t worker = 0; worker < workers; ++worker) {
+      const size_t begin = item_count * worker / workers;
+      const size_t end = item_count * (worker + 1) / workers;
+      threads.emplace_back([begin, end, worker, &fn]() {
+        fn(begin, end, worker);
+      });
+    }
+
+    for (auto & thread : threads) {
+      thread.join();
+    }
+    return workers;
+  }
+
   std::vector<int> detectCollisionIndices(int start, int end) const
   {
-    std::vector<int> indices;
-    start = std::max(0, start);
-    end = std::min(static_cast<int>(global_path_.size()) - 1, end);
+    std::vector<int> range_indices;
 
-    auto add_index = [&indices](int index) {
+    forEachIndexInForwardRange(start, end, [&](int i) {
+      range_indices.push_back(i);
+    });
+
+    if (range_indices.empty()) {
+      return {};
+    }
+
+    const size_t workers = effectiveParallelWorkers(range_indices.size());
+    std::vector<std::vector<int>> local_indices(workers);
+    parallelForRanges(range_indices.size(), [&](size_t begin, size_t end, size_t worker) {
+      auto & local = local_indices[worker];
+      local.reserve((end - begin) / 2 + 2);
+
+      for (size_t k = begin; k < end; ++k) {
+        const int i = range_indices[k];
+        if (isDeformationTriggerCollision(global_path_[i].x, global_path_[i].y, pathYawAtIndex(i))) {
+          local.push_back(i);
+        }
+
+        if (k == 0) {
+          continue;
+        }
+        const int prev = range_indices[k - 1];
+        const int curr = range_indices[k];
+        if (segmentCollision(
+            global_path_[prev].x,
+            global_path_[prev].y,
+            global_path_[curr].x,
+            global_path_[curr].y,
+            true))
+        {
+          local.push_back(prev);
+          local.push_back(curr);
+        }
+      }
+    });
+
+    std::vector<int> indices;
+    std::vector<bool> seen(global_path_.size(), false);
+    auto add_index = [&indices, &seen](int index) {
+      if (index < 0 || index >= static_cast<int>(seen.size()) || seen[index]) {
+        return;
+      }
+      seen[index] = true;
       indices.push_back(index);
     };
 
-    for (int i = start; i <= end; ++i) {
-      if (isFootprintCollision(global_path_[i].x, global_path_[i].y, pathYawAtIndex(i))) {
-        add_index(i);
-      }
-
-      if (i < end && segmentCollision(
-          global_path_[i].x,
-          global_path_[i].y,
-          global_path_[i + 1].x,
-          global_path_[i + 1].y))
-      {
-        add_index(i);
-        add_index(i + 1);
+    for (const auto & local : local_indices) {
+      for (const int index : local) {
+        add_index(index);
       }
     }
 
-    if (closed_loop_path_ && start == 0 && end == static_cast<int>(global_path_.size()) - 1) {
-      const int last = static_cast<int>(global_path_.size()) - 1;
+    if (closed_loop_path_ && range_indices.size() == global_path_.size()) {
+      const int first = range_indices.front();
+      const int last = range_indices.back();
       if (segmentCollision(
           global_path_[last].x,
           global_path_[last].y,
-          global_path_[0].x,
-          global_path_[0].y))
+          global_path_[first].x,
+          global_path_[first].y,
+          true))
       {
         add_index(last);
-        add_index(0);
+        add_index(first);
       }
     }
 
-    std::sort(indices.begin(), indices.end());
-    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
     return indices;
   }
 
@@ -643,7 +1212,10 @@ private:
     int ib = collision_indices.front();
 
     for (size_t k = 1; k < collision_indices.size(); ++k) {
-      if (collision_indices[k] - ib <= gap_tolerance_) {
+      const int gap = closed_loop_path_ ?
+        ringDistance(ib, collision_indices[k]) :
+        collision_indices[k] - ib;
+      if (gap <= gap_tolerance_) {
         ib = collision_indices[k];
       } else {
         clusters.emplace_back(ia, ib);
@@ -669,9 +1241,47 @@ private:
     return clusters;
   }
 
+  std::vector<std::pair<int, int>> splitLargeCollisionClusters(
+    const std::vector<std::pair<int, int>> & clusters) const
+  {
+    const int max_span = max_collision_cluster_span_;
+    if (max_span <= 0 || clusters.empty() || global_path_.empty()) {
+      return clusters;
+    }
+
+    std::vector<std::pair<int, int>> split_clusters;
+    for (const auto & cluster : clusters) {
+      int start = cluster.first;
+      const int end = cluster.second;
+      int remaining = closed_loop_path_ ?
+        ringDistance(start, end) :
+        std::max(0, end - start);
+
+      if (remaining <= max_span) {
+        split_clusters.push_back(cluster);
+        continue;
+      }
+
+      while (remaining > max_span) {
+        const int chunk_end = closed_loop_path_ ?
+          wrapIndex(start + max_span) :
+          std::min(end, start + max_span);
+        split_clusters.emplace_back(start, chunk_end);
+        start = closed_loop_path_ ? wrapIndex(chunk_end + 1) : chunk_end + 1;
+        remaining = closed_loop_path_ ?
+          ringDistance(start, end) :
+          std::max(0, end - start);
+      }
+
+      split_clusters.emplace_back(start, end);
+    }
+
+    return split_clusters;
+  }
+
   void getWindow(int ia, int ib, int min_start, int & is, int & ie) const
   {
-    if (closed_loop_path_ && use_full_path_search_) {
+    if (closed_loop_path_) {
       (void)min_start;
       const int last_index = static_cast<int>(global_path_.size()) - 1;
       if (ia == 0 && ib == last_index) {
@@ -680,12 +1290,14 @@ private:
         return;
       }
       is = wrapIndex(ia - backward_waypoints_);
-      ie = wrapIndex(ib + forward_waypoints_);
+      ie = wrapIndex(ib + std::max(0, deformation_tail_waypoints_) + forward_waypoints_);
       return;
     }
 
     is = std::max(min_start, ia - backward_waypoints_);
-    ie = std::min(static_cast<int>(global_path_.size()) - 1, ib + forward_waypoints_);
+    ie = std::min(
+      static_cast<int>(global_path_.size()) - 1,
+      ib + std::max(0, deformation_tail_waypoints_) + forward_waypoints_);
   }
 
   DeformationWindow getWindow(int ia, int ib, int min_start) const
@@ -748,29 +1360,214 @@ private:
       return smoothRamp(eta);
     }
 
-    if (dist_end <= dist_collision_end) return 1.0;
+    const int dist_full_shift_end = std::min(
+      dist_end,
+      dist_collision_end + std::max(0, deformation_tail_waypoints_));
+    if (dist_i <= dist_full_shift_end) return 1.0;
+    if (dist_end <= dist_full_shift_end) return 1.0;
+
     const double eta = static_cast<double>(dist_end - dist_i) /
-      static_cast<double>(dist_end - dist_collision_end);
+      static_cast<double>(dist_end - dist_full_shift_end);
     return smoothRamp(eta);
+  }
+
+  bool windowsOverlap(const DeformationWindow & a, const DeformationWindow & b) const
+  {
+    if (!a.active() || !b.active()) return false;
+
+    bool overlap = false;
+    forEachIndexInForwardRange(a.start, a.end, [&](int i) {
+      if (!overlap && indexInForwardRange(i, b.start, b.end)) {
+        overlap = true;
+      }
+    });
+    return overlap;
+  }
+
+  std::vector<PathDeformation> smoothWithActiveDeformations(
+    const std::vector<PathDeformation> & candidate_deformations) const
+  {
+    if (!hasActiveDeformation() || candidate_deformations.empty()) {
+      return candidate_deformations;
+    }
+
+    const double alpha = std::clamp(deformation_smoothing_alpha_, 0.0, 1.0);
+    if (alpha >= 1.0) {
+      return candidate_deformations;
+    }
+
+    std::vector<PathDeformation> smoothed = candidate_deformations;
+    for (auto & candidate : smoothed) {
+      const PathDeformation * best_match = nullptr;
+      for (const auto & active : active_deformations_) {
+        if (!active.active() || !windowsOverlap(candidate.window, active.window)) {
+          continue;
+        }
+        if (candidate.shift * active.shift < 0.0) {
+          continue;
+        }
+        best_match = &active;
+        break;
+      }
+
+      if (best_match != nullptr) {
+        candidate.shift = alpha * candidate.shift + (1.0 - alpha) * best_match->shift;
+      }
+    }
+
+    return deformationsCollision(smoothed) ? candidate_deformations : smoothed;
+  }
+
+  bool activeDeformationStillRelevant(
+    const PathDeformation & deformation,
+    int search_start) const
+  {
+    if (!deformation.active()) return false;
+    if (deformation_hold_cycles_ >= 0 && active_clear_cycles_ >= deformation_hold_cycles_) {
+      return false;
+    }
+
+    if (closed_loop_path_) {
+      const int max_hold_distance = std::max(
+        0,
+        collision_search_lookahead_waypoints_ +
+        forward_waypoints_ +
+        std::max(0, deformation_tail_waypoints_));
+      if (ringDistance(search_start, deformation.window.end) > max_hold_distance) {
+        return false;
+      }
+    } else if (search_start > deformation.window.end) {
+      return false;
+    }
+
+    return !deformationsCollision({deformation});
+  }
+
+  std::vector<PathDeformation> mergeReusableActiveDeformations(
+    const std::vector<PathDeformation> & candidate_deformations,
+    int search_start) const
+  {
+    if (!preserve_active_deformations_ || !hasActiveDeformation()) {
+      return candidate_deformations;
+    }
+
+    std::vector<PathDeformation> merged = candidate_deformations;
+    for (const auto & active : active_deformations_) {
+      if (!activeDeformationStillRelevant(active, search_start)) {
+        continue;
+      }
+
+      bool overlaps_candidate = false;
+      for (const auto & candidate : candidate_deformations) {
+        if (windowsOverlap(active.window, candidate.window)) {
+          overlaps_candidate = true;
+          break;
+        }
+      }
+      if (overlaps_candidate) {
+        continue;
+      }
+
+      std::vector<PathDeformation> trial = merged;
+      trial.push_back(active);
+      if (!deformationsCollision(trial)) {
+        merged.push_back(active);
+      }
+    }
+
+    std::stable_sort(
+      merged.begin(),
+      merged.end(),
+      [this, search_start](const PathDeformation & a, const PathDeformation & b) {
+        const int a_rank = closed_loop_path_ ?
+          ringDistance(search_start, a.window.start) :
+          a.window.start;
+        const int b_rank = closed_loop_path_ ?
+          ringDistance(search_start, b.window.start) :
+          b.window.start;
+        return a_rank < b_rank;
+      });
+
+    return merged;
+  }
+
+  double estimateSideClearance(int is, int ie, int sign) const
+  {
+    if (sign == 0 || global_path_.empty()) return 0.0;
+
+    const double step = std::max(0.05, effectiveCollisionCheckStep());
+    const double limit = std::max(step, std::min(max_shift_, 1.20));
+    double clearance_sum = 0.0;
+    int sample_count = 0;
+
+    forEachIndexInForwardRange(is, ie, [&](int i) {
+      double nx = 0.0;
+      double ny = 0.0;
+      computeNormal(i, nx, ny);
+      if (std::hypot(nx, ny) < 1e-6) return;
+
+      const double yaw = pathYawAtIndex(i);
+      double clear_distance = 0.0;
+      for (double d = step; d <= limit + 1e-9; d += step) {
+        const double x = global_path_[i].x + static_cast<double>(sign) * d * nx;
+        const double y = global_path_[i].y + static_cast<double>(sign) * d * ny;
+        if (isFootprintCollision(x, y, yaw)) {
+          break;
+        }
+        clear_distance = d;
+      }
+
+      clearance_sum += clear_distance;
+      ++sample_count;
+    });
+
+    return sample_count > 0 ? clearance_sum / static_cast<double>(sample_count) : 0.0;
+  }
+
+  int estimateClearanceShiftSign(int is, int ie) const
+  {
+    const double positive_clearance = estimateSideClearance(is, ie, 1);
+    const double negative_clearance = estimateSideClearance(is, ie, -1);
+    const double margin = std::max(0.0, shift_direction_clearance_margin_);
+
+    if (positive_clearance > negative_clearance + margin) return 1;
+    if (negative_clearance > positive_clearance + margin) return -1;
+    return 0;
   }
 
   int estimateShiftSign(int is, int ie) const
   {
+    const int clearance_sign = estimateClearanceShiftSign(is, ie);
+    if (clearance_sign != 0) {
+      return clearance_sign;
+    }
+
     double scan_signed_sum = 0.0;
     int scan_count = 0;
 
-    if (scanOverlayFresh()) {
-      const double radius = footprintBoundingRadius() + std::max(0.0, scan_overlay_extra_margin_);
+    if (scan_overlay_trigger_enabled_ && scanOverlayFresh()) {
       forEachIndexInForwardRange(is, ie, [&](int i) {
         double nx = 0.0;
         double ny = 0.0;
         computeNormal(i, nx, ny);
         if (std::hypot(nx, ny) < 1e-6) return;
+        const double yaw = pathYawAtIndex(i);
 
         for (const auto & obstacle : scan_obstacles_) {
+          if (!scanObstacleNearPathPoint(obstacle, global_path_[i].x, global_path_[i].y) &&
+              !scanObstacleInLocalBox(
+              obstacle,
+              global_path_[i].x,
+              global_path_[i].y,
+              yaw,
+              scan_overlay_trigger_extra_margin_,
+              scan_overlay_trigger_forward_distance_,
+              scan_overlay_trigger_lateral_width_))
+          {
+            continue;
+          }
           const double vx = obstacle.x - global_path_[i].x;
           const double vy = obstacle.y - global_path_[i].y;
-          if (std::hypot(vx, vy) > radius) continue;
           scan_signed_sum += vx * nx + vy * ny;
           ++scan_count;
         }
@@ -780,6 +1577,42 @@ private:
     if (scan_count > 0) {
       return scan_signed_sum > 0.0 ? -1 : 1;
     }
+
+    if (scan_overlay_boundary_enabled_ && scanOverlayFresh()) {
+      double boundary_signed_sum = 0.0;
+      int boundary_count = 0;
+      forEachIndexInForwardRange(is, ie, [&](int i) {
+        double nx = 0.0;
+        double ny = 0.0;
+        computeNormal(i, nx, ny);
+        if (std::hypot(nx, ny) < 1e-6) return;
+        const double yaw = pathYawAtIndex(i);
+
+        for (const auto & obstacle : scan_obstacles_) {
+          if (!scanObstacleInLocalBox(
+              obstacle,
+              global_path_[i].x,
+              global_path_[i].y,
+              yaw,
+              scan_overlay_boundary_extra_margin_,
+              0.0,
+              0.0))
+          {
+            continue;
+          }
+          const double vx = obstacle.x - global_path_[i].x;
+          const double vy = obstacle.y - global_path_[i].y;
+          boundary_signed_sum += vx * nx + vy * ny;
+          ++boundary_count;
+        }
+      });
+
+      if (boundary_count > 0) {
+        return boundary_signed_sum > 0.0 ? -1 : 1;
+      }
+    }
+
+    if (!map_collision_enabled_) return 0;
 
     double map_signed_sum = 0.0;
     int map_count = 0;
@@ -804,6 +1637,7 @@ private:
             (static_cast<double>(mx + dx) + 0.5) * map_.info.resolution;
           const double cell_y = map_.info.origin.position.y +
             (static_cast<double>(my + dy) + 0.5) * map_.info.resolution;
+          if (!scanConfirmsMapOccupied(cell_x, cell_y)) continue;
 
           const double vx = cell_x - global_path_[i].x;
           const double vy = cell_y - global_path_[i].y;
@@ -822,7 +1656,8 @@ private:
     const std::vector<PathDeformation> & deformations,
     int first,
     int last,
-    bool include_closing_segment) const
+    bool include_closing_segment,
+    bool use_deformation_trigger = false) const
   {
     if (global_path_.empty()) return false;
 
@@ -838,13 +1673,17 @@ private:
     const Waypoint first_wp = shiftedWaypoint(first, deformations);
     Waypoint prev = first_wp;
     int prev_index = first;
-    if (isFootprintCollision(prev.x, prev.y, pathYawAtIndex(prev_index))) return true;
+    if (use_deformation_trigger) {
+      if (isDeformationTriggerCollision(prev.x, prev.y, pathYawAtIndex(prev_index))) return true;
+    } else if (isFootprintCollision(prev.x, prev.y, pathYawAtIndex(prev_index))) {
+      return true;
+    }
 
     if (closed_loop_path_) {
       int i = wrapIndex(first + 1);
       for (size_t steps = 1; steps < global_path_.size(); ++steps) {
         const Waypoint curr = shiftedWaypoint(i, deformations);
-        if (segmentCollision(prev.x, prev.y, curr.x, curr.y)) return true;
+        if (segmentCollision(prev.x, prev.y, curr.x, curr.y, use_deformation_trigger)) return true;
         prev = curr;
         prev_index = i;
         if (i == last) break;
@@ -853,14 +1692,16 @@ private:
     } else {
       for (int i = first + 1; i <= last; ++i) {
         const Waypoint curr = shiftedWaypoint(i, deformations);
-        if (segmentCollision(prev.x, prev.y, curr.x, curr.y)) return true;
+        if (segmentCollision(prev.x, prev.y, curr.x, curr.y, use_deformation_trigger)) return true;
         prev = curr;
         prev_index = i;
       }
     }
 
     if (include_closing_segment && prev_index != first) {
-      if (segmentCollision(prev.x, prev.y, first_wp.x, first_wp.y)) return true;
+      if (segmentCollision(prev.x, prev.y, first_wp.x, first_wp.y, use_deformation_trigger)) {
+        return true;
+      }
     }
 
     return false;
@@ -869,7 +1710,8 @@ private:
   bool correctedWindowCollision(
     const DeformationWindow & window,
     double shift,
-    const std::vector<PathDeformation> & existing_deformations = {}) const
+    const std::vector<PathDeformation> & existing_deformations = {},
+    bool use_deformation_trigger = false) const
   {
     if (!window.active()) return false;
 
@@ -883,17 +1725,79 @@ private:
       wrapIndex(window.end + 1) :
       std::min(static_cast<int>(global_path_.size()) - 1, window.end + 1);
 
-    return pathRangeCollision(deformations, first, last, false);
+    return pathRangeCollision(deformations, first, last, false, use_deformation_trigger);
   }
 
-  bool deformationsCollision(const std::vector<PathDeformation> & deformations) const
+  bool deformationsCollision(
+    const std::vector<PathDeformation> & deformations,
+    bool use_deformation_trigger = false) const
   {
     if (deformations.empty()) return false;
     return pathRangeCollision(
       deformations,
       0,
       static_cast<int>(global_path_.size()) - 1,
-      closed_loop_path_);
+      closed_loop_path_,
+      use_deformation_trigger);
+  }
+
+  double refineSafeShift(
+    const DeformationWindow & window,
+    int sign,
+    double unsafe_abs_shift,
+    double safe_abs_shift,
+    const std::vector<PathDeformation> & existing_deformations) const
+  {
+    if (!shift_refine_enabled_ || shift_refine_iterations_ <= 0 || sign == 0) {
+      return static_cast<double>(sign) * safe_abs_shift;
+    }
+
+    double lo = std::max(0.0, unsafe_abs_shift);
+    double hi = std::max(lo, safe_abs_shift);
+    const double min_shift = std::max(0.0, minimum_deformation_shift_);
+    if (min_shift > 0.0 && hi >= min_shift) {
+      lo = std::max(lo, std::min(min_shift, hi));
+    }
+
+    for (int iter = 0; iter < shift_refine_iterations_; ++iter) {
+      const double mid = 0.5 * (lo + hi);
+      const double candidate = static_cast<double>(sign) * mid;
+      if (correctedWindowCollision(window, candidate, existing_deformations)) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+
+    const double refined_safe_shift = hi;
+    const double extra_shift = std::max(0.0, deformation_extra_shift_);
+    if (extra_shift <= 0.0) {
+      return static_cast<double>(sign) * refined_safe_shift;
+    }
+
+    const double target_shift = std::min(max_shift_, refined_safe_shift + extra_shift);
+    if (target_shift <= refined_safe_shift) {
+      return static_cast<double>(sign) * refined_safe_shift;
+    }
+
+    const double target_candidate = static_cast<double>(sign) * target_shift;
+    if (!correctedWindowCollision(window, target_candidate, existing_deformations)) {
+      return target_candidate;
+    }
+
+    double safe = refined_safe_shift;
+    double unsafe = target_shift;
+    for (int iter = 0; iter < shift_refine_iterations_; ++iter) {
+      const double mid = 0.5 * (safe + unsafe);
+      const double candidate = static_cast<double>(sign) * mid;
+      if (correctedWindowCollision(window, candidate, existing_deformations)) {
+        unsafe = mid;
+      } else {
+        safe = mid;
+      }
+    }
+
+    return static_cast<double>(sign) * safe;
   }
 
   bool findSafeShift(
@@ -926,22 +1830,18 @@ private:
     }
 
     const int max_iter = static_cast<int>(std::ceil(max_shift_ / shift_step_));
-    for (int k = 0; k <= max_iter; ++k) {
-      if (k == 0) {
-        if (!correctedWindowCollision(window, 0.0, existing_deformations)) {
-          shift = 0.0;
-          return true;
-        }
-        continue;
-      }
-
+    for (int k = 1; k <= max_iter; ++k) {
       for (const int sign : shift_signs) {
         const double d = std::clamp(
           static_cast<double>(sign) * static_cast<double>(k) * shift_step_,
           -max_shift_,
           max_shift_);
         if (!correctedWindowCollision(window, d, existing_deformations)) {
-          shift = d;
+          const double safe_abs_shift = std::abs(d);
+          const double unsafe_abs_shift = std::min(
+            safe_abs_shift,
+            static_cast<double>(k - 1) * shift_step_);
+          shift = refineSafeShift(window, sign, unsafe_abs_shift, safe_abs_shift, existing_deformations);
           return true;
         }
       }
@@ -949,9 +1849,112 @@ private:
 
     shift = 0.0;
     failure_reason = allow_opposite_shift_ ?
-      "no_safe_shift_within_max_shift_both_directions" :
-      "no_safe_shift_within_max_shift";
+      "window_collision_all_shift_candidates_both_directions" :
+      "window_collision_all_shift_candidates";
     return false;
+  }
+
+  bool dynamicPointcloudFresh() const
+  {
+    if (!dynamic_acc_enabled_ || dynamic_points_.empty() || dynamic_acc_ttl_ms_ <= 0) {
+      return false;
+    }
+
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - last_dynamic_pointcloud_time_);
+    return age.count() <= dynamic_acc_ttl_ms_;
+  }
+
+  double applyDynamicAccVelocityLimit(double nominal_speed) const
+  {
+    if (nominal_speed <= 0.0 || !dynamicPointcloudFresh()) {
+      return nominal_speed;
+    }
+
+    const double yaw_limit = std::max(0.0, dynamic_acc_front_yaw_limit_);
+    const double lateral_width = std::max(0.0, dynamic_acc_lateral_width_);
+    const double min_distance = std::max(0.0, dynamic_acc_min_distance_);
+    const double max_distance = std::max(min_distance, dynamic_acc_max_distance_);
+    const double time_headway = std::max(0.0, dynamic_acc_time_headway_);
+    const double distance_gain = std::max(0.0, dynamic_acc_distance_gain_);
+    const double min_speed = std::max(0.0, dynamic_acc_min_speed_);
+    double limited_speed = nominal_speed;
+
+    for (const auto & point : dynamic_points_) {
+      const double range = point.range;
+      if (!std::isfinite(range) || range <= 0.0 || range > max_distance) {
+        continue;
+      }
+
+      const double bearing = std::atan2(std::sin(point.relative_yaw), std::cos(point.relative_yaw));
+      if (!std::isfinite(bearing) || !std::isfinite(point.relative_speed)) {
+        continue;
+      }
+      if (std::abs(bearing) > yaw_limit) {
+        continue;
+      }
+
+      const double lateral_offset = std::abs(std::sin(bearing) * range);
+      if (lateral_width > 0.0 && lateral_offset > lateral_width) {
+        continue;
+      }
+
+      const double desired_distance = min_distance + time_headway * nominal_speed;
+      const double distance_error = range - desired_distance;
+      const double lead_speed = std::max(0.0, point.relative_speed + dynamic_acc_speed_margin_);
+      const double acc_speed = lead_speed + distance_gain * distance_error;
+      limited_speed = std::min(limited_speed, std::clamp(acc_speed, min_speed, nominal_speed));
+    }
+
+    return limited_speed;
+  }
+
+  double normalizeAngle(double angle) const
+  {
+    return std::atan2(std::sin(angle), std::cos(angle));
+  }
+
+  double shiftedPathYawAtIndex(int index, const std::vector<Waypoint> & shifted_path) const
+  {
+    if (shifted_path.empty()) return 0.0;
+
+    const int last_index = static_cast<int>(shifted_path.size()) - 1;
+    int i0 = std::max(0, index - 1);
+    int i1 = std::min(last_index, index + 1);
+
+    if (closed_loop_path_ && shifted_path.size() > 2) {
+      i0 = (index == 0) ? last_index : index - 1;
+      i1 = (index == last_index) ? 0 : index + 1;
+    }
+
+    return std::atan2(
+      shifted_path[i1].y - shifted_path[i0].y,
+      shifted_path[i1].x - shifted_path[i0].x);
+  }
+
+  double applyCurvatureVelocityLimit(
+    int index,
+    double nominal_speed,
+    const std::vector<Waypoint> & shifted_path) const
+  {
+    if (!curvature_speed_limit_enabled_ || nominal_speed <= 0.0 || shifted_path.size() < 3) {
+      return nominal_speed;
+    }
+
+    const double start = std::max(0.0, curvature_yaw_slowdown_start_);
+    const double full = std::max(start + 1e-6, curvature_yaw_slowdown_full_);
+    const double min_scale = std::clamp(curvature_min_speed_scale_, 0.0, 1.0);
+    const double yaw_error = std::abs(normalizeAngle(
+      shiftedPathYawAtIndex(index, shifted_path) - pathYawAtIndex(index)));
+
+    if (yaw_error <= start) {
+      return nominal_speed;
+    }
+
+    const double ratio = std::clamp((yaw_error - start) / (full - start), 0.0, 1.0);
+    const double scale = 1.0 - ratio * (1.0 - min_scale);
+    const double limited_speed = nominal_speed * scale;
+    return std::clamp(limited_speed, std::max(0.0, curvature_min_speed_), nominal_speed);
   }
 
   nav_msgs::msg::Path makeCorrectedPath(
@@ -962,20 +1965,23 @@ private:
     path.header.frame_id = path_frame_id_;
     path.poses.reserve(global_path_.size());
 
+    std::vector<Waypoint> shifted_path;
+    shifted_path.reserve(global_path_.size());
     for (int i = 0; i < static_cast<int>(global_path_.size()); ++i) {
+      shifted_path.push_back(shiftedWaypoint(i, deformations));
+    }
+
+    for (int i = 0; i < static_cast<int>(shifted_path.size()); ++i) {
       geometry_msgs::msg::PoseStamped ps;
       ps.header = path.header;
 
-      double x = global_path_[i].x;
-      double y = global_path_[i].y;
+      double speed = global_path_[i].v;
+      speed = applyCurvatureVelocityLimit(i, speed, shifted_path);
+      speed = applyDynamicAccVelocityLimit(speed);
 
-      const Waypoint shifted = shiftedWaypoint(i, deformations);
-      x = shifted.x;
-      y = shifted.y;
-
-      ps.pose.position.x = x;
-      ps.pose.position.y = y;
-      ps.pose.position.z = global_path_[i].v;  // preserve velocity in z
+      ps.pose.position.x = shifted_path[i].x;
+      ps.pose.position.y = shifted_path[i].y;
+      ps.pose.position.z = speed;
       ps.pose.orientation.w = 1.0;
       path.poses.push_back(ps);
     }
@@ -1014,7 +2020,8 @@ private:
   {
     const auto process_start = std::chrono::steady_clock::now();
 
-    if (!map_received_ || !path_received_ || global_path_.size() < 3) {
+    const bool map_ready = map_received_ || !map_collision_enabled_;
+    if (!map_ready || !path_received_ || global_path_.size() < 3) {
       logWaitingState();
       writeMetrics(
         "waiting",
@@ -1031,99 +2038,123 @@ private:
         elapsedProcessMs(process_start));
       return;
     }
-    logFrameMismatch();
+    if (map_collision_enabled_) {
+      logFrameMismatch();
+    }
 
     int closest_index = 0;
     int search_start = 0;
     int search_end = static_cast<int>(global_path_.size()) - 1;
     getCollisionSearchRange(closest_index, search_start, search_end);
 
-    const auto collision_indices = detectCollisionIndices(search_start, search_end);
-
+    std::vector<int> collision_indices;
     std::vector<PathDeformation> deformations;
     std::string state = "clear";
     size_t cluster_count = 0;
     size_t failed_clusters = 0;
     std::vector<std::string> failure_details;
 
-    if (!collision_indices.empty()) {
-      const auto clusters = getCollisionClusters(collision_indices);
+    if (canHoldActiveDeformation(search_start, active_deformation_hold_uses_trigger_)) {
+      deformations = active_deformations_;
+      active_collision_grace_cycles_ = 0;
+      ++active_clear_cycles_;
+      state = "holding";
+      logHoldState(closest_index, search_start, search_end, "active path remains collision-free");
+    } else {
+      collision_indices = detectCollisionIndices(search_start, search_end);
+    }
+
+    if (state != "holding" && !collision_indices.empty()) {
+      const auto clusters = splitLargeCollisionClusters(getCollisionClusters(collision_indices));
       cluster_count = clusters.size();
 
-      if (canHoldActiveDeformation(search_start)) {
-        deformations = active_deformations_;
-        ++active_clear_cycles_;
-        state = "holding";
-        logHoldState(closest_index, search_start, search_end, "active path remains collision-free");
-      } else {
-        int min_window_start = use_full_path_search_ ? 0 : search_start;
+      int min_window_start = use_full_path_search_ ? 0 : search_start;
 
-        for (const auto & cluster : clusters) {
-          const int ia = cluster.first;
-          const int ib = cluster.second;
-          DeformationWindow window = getWindow(ia, ib, min_window_start);
-          if (!window.active()) {
-            ++failed_clusters;
-            failure_details.push_back(makeFailureDetail(ia, ib, window, 0, "invalid_window"));
-            continue;
-          }
-
-          const int shift_sign = estimateShiftSign(ia, ib);
-          double d_req = 0.0;
-          std::string failure_reason;
-          const bool safe_shift_found =
-            findSafeShift(window, shift_sign, deformations, d_req, failure_reason);
-          if (safe_shift_found) {
-            deformations.push_back(PathDeformation{window, d_req});
-            min_window_start = window.end + 1;
-          } else {
-            ++failed_clusters;
-            failure_details.push_back(makeFailureDetail(ia, ib, window, shift_sign, failure_reason));
-          }
+      for (const auto & cluster : clusters) {
+        const int ia = cluster.first;
+        const int ib = cluster.second;
+        DeformationWindow window = getWindow(ia, ib, min_window_start);
+        if (!window.active()) {
+          ++failed_clusters;
+          failure_details.push_back(makeFailureDetail(ia, ib, window, 0, "invalid_window"));
+          continue;
         }
 
-        if (!deformations.empty()) {
-          active_deformation_valid_ = true;
-          active_deformations_ = deformations;
-          active_clear_cycles_ = 0;
-          state = "deforming";
-          logDeformationState(
-            collision_indices.size(),
-            cluster_count,
-            deformations.size(),
-            failed_clusters,
-            closest_index,
-            search_start,
-            search_end,
-            deformations);
-        } else if (canHoldActiveDeformation(search_start)) {
-          deformations = active_deformations_;
-          ++active_clear_cycles_;
-          state = "holding";
-          logHoldState(closest_index, search_start, search_end, "safe shift search failed");
+        const int shift_sign = estimateShiftSign(ia, ib);
+        double d_req = 0.0;
+        std::string failure_reason;
+        bool safe_shift_found =
+          findSafeShift(window, shift_sign, deformations, d_req, failure_reason);
+        if (safe_shift_found) {
+          deformations.push_back(PathDeformation{window, d_req});
+          min_window_start = window.end + 1;
         } else {
-          state = "unsafe";
-          if (hasActiveDeformation()) {
-            deformations = active_deformations_;
-            ++active_clear_cycles_;
-          } else {
-            clearActiveDeformation();
-          }
-          logUnsafeState(
-            collision_indices.size(),
-            cluster_count,
-            closest_index,
-            search_start,
-            search_end,
-            !deformations.empty());
+          ++failed_clusters;
+          failure_details.push_back(makeFailureDetail(ia, ib, window, shift_sign, failure_reason));
         }
       }
-    } else if (canHoldActiveDeformation(search_start)) {
+
+      if (!deformations.empty() && shouldKeepActiveOverPartialUpdate(failed_clusters)) {
+        deformations = active_deformations_;
+        ++active_collision_grace_cycles_;
+        ++active_clear_cycles_;
+        state = "holding";
+        logHoldState(
+          closest_index,
+          search_start,
+          search_end,
+          "keeping previous deformation over partial update");
+      } else if (!deformations.empty()) {
+        deformations = mergeReusableActiveDeformations(deformations, search_start);
+        deformations = smoothWithActiveDeformations(deformations);
+        active_deformation_valid_ = true;
+        active_deformations_ = deformations;
+        active_clear_cycles_ = 0;
+        active_collision_grace_cycles_ = 0;
+        state = "deforming";
+        logDeformationState(
+          collision_indices.size(),
+          cluster_count,
+          deformations.size(),
+          failed_clusters,
+          closest_index,
+          search_start,
+          search_end,
+          deformations);
+      } else if (canHoldActiveDeformation(search_start, active_deformation_hold_uses_trigger_)) {
+        deformations = active_deformations_;
+        active_collision_grace_cycles_ = 0;
+        ++active_clear_cycles_;
+        state = "holding";
+        logHoldState(closest_index, search_start, search_end, "safe shift search failed");
+      } else {
+        state = "unsafe";
+        if (hasActiveDeformation()) {
+          deformations = active_deformations_;
+          ++active_clear_cycles_;
+        } else {
+          clearActiveDeformation();
+        }
+        logUnsafeState(
+          collision_indices.size(),
+          cluster_count,
+          closest_index,
+          search_start,
+          search_end,
+          !deformations.empty());
+      }
+    } else if (state != "holding" && canHoldActiveDeformation(search_start)) {
       deformations = active_deformations_;
+      active_collision_grace_cycles_ = 0;
       ++active_clear_cycles_;
       state = "holding";
       logHoldState(closest_index, search_start, search_end, "temporary clear detection");
-    } else {
+    } else if (state != "holding" && canReleaseHoldActiveDeformation()) {
+      deformations = active_deformations_;
+      ++active_clear_cycles_;
+      state = "holding";
+      logHoldState(closest_index, search_start, search_end, "release hysteresis");
+    } else if (state != "holding") {
       clearActiveDeformation();
       logClearState();
     }
@@ -1338,7 +2369,7 @@ private:
     return oss.str();
   }
 
-  bool canHoldActiveDeformation(int search_start) const
+  bool canHoldActiveDeformation(int search_start, bool use_deformation_trigger = false) const
   {
     if (!hasActiveDeformation()) {
       return false;
@@ -1346,10 +2377,46 @@ private:
     if (deformation_hold_cycles_ >= 0 && active_clear_cycles_ >= deformation_hold_cycles_) {
       return false;
     }
-    if (search_start > active_deformations_.back().window.end) {
+    if (closed_loop_path_) {
+      const int max_hold_distance = std::max(
+        0,
+        collision_search_lookahead_waypoints_ +
+        forward_waypoints_ +
+        std::max(0, deformation_tail_waypoints_));
+      if (ringDistance(search_start, active_deformations_.back().window.end) > max_hold_distance) {
+        return false;
+      }
+    } else {
+      if (search_start > active_deformations_.back().window.end) {
+        return false;
+      }
+    }
+    return !deformationsCollision(active_deformations_, use_deformation_trigger);
+  }
+
+  bool canReleaseHoldActiveDeformation() const
+  {
+    if (!hasActiveDeformation()) {
+      return false;
+    }
+    if (deformation_release_cycles_ < 0) {
+      return !deformationsCollision(active_deformations_);
+    }
+    if (active_clear_cycles_ >= deformation_release_cycles_) {
       return false;
     }
     return !deformationsCollision(active_deformations_);
+  }
+
+  bool shouldKeepActiveOverPartialUpdate(size_t failed_clusters) const
+  {
+    if (!hasActiveDeformation() || failed_clusters == 0 || deformationsCollision(active_deformations_)) {
+      return false;
+    }
+    if (deformation_partial_update_grace_cycles_ < 0) {
+      return true;
+    }
+    return active_collision_grace_cycles_ < deformation_partial_update_grace_cycles_;
   }
 
   bool hasActiveDeformation() const
@@ -1362,6 +2429,7 @@ private:
     active_deformation_valid_ = false;
     active_deformations_.clear();
     active_clear_cycles_ = 0;
+    active_collision_grace_cycles_ = 0;
   }
 
   bool shouldLogStatus()
@@ -1595,6 +2663,22 @@ private:
   std::string obj_flag_topic_;
   std::string pcd_static_obstacle_topic_;
   bool metrics_enabled_{true};
+  bool latched_input_qos_{true};
+  bool dynamic_acc_enabled_{true};
+  int dynamic_acc_ttl_ms_{500};
+  double dynamic_acc_front_yaw_limit_{0.60};
+  double dynamic_acc_lateral_width_{0.60};
+  double dynamic_acc_min_distance_{0.80};
+  double dynamic_acc_max_distance_{4.00};
+  double dynamic_acc_time_headway_{1.00};
+  double dynamic_acc_distance_gain_{0.80};
+  double dynamic_acc_speed_margin_{0.0};
+  double dynamic_acc_min_speed_{0.0};
+  bool curvature_speed_limit_enabled_{true};
+  double curvature_yaw_slowdown_start_{0.25};
+  double curvature_yaw_slowdown_full_{0.80};
+  double curvature_min_speed_scale_{0.45};
+  double curvature_min_speed_{0.05};
   std::string metrics_csv_path_{
     "/home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv"};
   std::string metrics_actual_csv_path_;
@@ -1605,7 +2689,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_scan_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_static_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_dynamic_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_dynamic_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr sub_flag_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcd_static_cloud_;
 
@@ -1622,8 +2706,16 @@ private:
   std::string odom_frame_id_;
   double odom_x_{0.0};
   double odom_y_{0.0};
+  double odom_yaw_{0.0};
+  bool tracked_closest_index_valid_{false};
+  int tracked_closest_index_{0};
+  size_t tracked_closest_path_size_{0};
   std::vector<ScanObstacle> scan_obstacles_;
+  std::unordered_map<int64_t, std::vector<size_t>> scan_obstacle_index_;
+  std::vector<DynamicPoint> dynamic_points_;
   std::chrono::steady_clock::time_point last_scan_overlay_time_{
+    std::chrono::steady_clock::time_point::min()};
+  std::chrono::steady_clock::time_point last_dynamic_pointcloud_time_{
     std::chrono::steady_clock::time_point::min()};
 
   bool map_info_logged_{false};
@@ -1647,11 +2739,19 @@ private:
   bool active_deformation_valid_{false};
   std::vector<PathDeformation> active_deformations_;
   int active_clear_cycles_{0};
+  int active_collision_grace_cycles_{0};
 
   double robot_radius_{0.14};
   double vehicle_width_{0.28};
   double vehicle_length_{0.512};
   double footprint_margin_{0.10};
+  bool map_collision_enabled_{true};
+  bool map_occupied_requires_scan_confirmation_{false};
+  double map_occupied_scan_confirmation_radius_{0.20};
+  bool map_trigger_enabled_{true};
+  double map_trigger_extra_margin_{0.15};
+  double map_trigger_lateral_width_{0.50};
+  double map_trigger_forward_distance_{1.20};
   int occupied_threshold_{65};
   bool unknown_occupied_{true};
   bool scan_overlay_enabled_{true};
@@ -1659,20 +2759,49 @@ private:
   double scan_overlay_min_range_{0.10};
   double scan_overlay_max_range_{0.0};
   int scan_overlay_stride_{1};
+  double scan_overlay_index_cell_size_{0.25};
   double scan_overlay_extra_margin_{0.05};
+  bool scan_overlay_boundary_enabled_{true};
+  bool scan_overlay_trigger_enabled_{true};
+  double scan_overlay_boundary_extra_margin_{0.05};
+  double scan_overlay_trigger_extra_margin_{0.05};
+  double scan_overlay_trigger_lateral_width_{0.0};
+  double scan_overlay_trigger_forward_distance_{0.0};
+  double scan_overlay_near_trigger_radius_{0.0};
+  double scan_overlay_sensor_x_{0.0};
+  double scan_overlay_sensor_y_{0.0};
+  double scan_overlay_sensor_yaw_{0.0};
   int backward_waypoints_{8};
   int forward_waypoints_{20};
+  int deformation_tail_waypoints_{0};
   int gap_tolerance_{2};
+  int max_collision_cluster_span_{0};
   bool closed_loop_path_{true};
+  int closest_index_backward_search_waypoints_{5};
+  int closest_index_forward_search_waypoints_{45};
+  double closest_index_reset_distance_{1.20};
   bool use_full_path_search_{true};
   int collision_search_start_ahead_waypoints_{8};
   int collision_search_lookahead_waypoints_{160};
   int deformation_hold_cycles_{-1};
+  int deformation_release_cycles_{60};
+  int deformation_partial_update_grace_cycles_{12};
+  bool preserve_active_deformations_{true};
+  bool active_deformation_hold_uses_trigger_{false};
   double shift_step_{0.05};
   double max_shift_{0.50};
+  double minimum_deformation_shift_{0.0};
+  double deformation_extra_shift_{0.0};
+  double deformation_smoothing_alpha_{0.35};
+  double shift_direction_clearance_margin_{0.05};
+  bool shift_refine_enabled_{true};
+  int shift_refine_iterations_{5};
   bool allow_opposite_shift_{true};
   double collision_check_step_{0.0};
   int process_period_ms_{20};
+  bool parallel_enabled_{true};
+  int parallel_threads_{0};
+  int parallel_min_items_{16};
   int metrics_flush_period_{20};
   size_t metrics_write_count_{0};
 };

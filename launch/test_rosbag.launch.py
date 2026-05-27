@@ -12,6 +12,7 @@ def generate_launch_description():
     bag_path = LaunchConfiguration('bag_path')
     play_bag = LaunchConfiguration('play_bag')
     use_sim_time = LaunchConfiguration('use_sim_time')
+    default_bag_path = '/home/rcv/Documents/global_path_deformer/latest'
     config_file = os.path.join(
         get_package_share_directory('global_path_deformer'),
         'config',
@@ -19,8 +20,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('bag_path', default_value='', description='Path to rosbag2 directory'),
-        DeclareLaunchArgument('play_bag', default_value='false', description='Play rosbag2 when true'),
+        DeclareLaunchArgument('bag_path', default_value=default_bag_path, description='Path to rosbag2 directory'),
+        DeclareLaunchArgument('play_bag', default_value='true', description='Play the configured rosbag2 directory'),
         DeclareLaunchArgument('use_sim_time', default_value='true'),
 
         ExecuteProcess(
@@ -37,6 +38,8 @@ def generate_launch_description():
             parameters=[
                 config_file,
                 {'use_sim_time': use_sim_time},
+                {'latched_input_qos': False},
+                {'scan_topic': '/scan_matched_points2'},
             ]
         )
     ])
