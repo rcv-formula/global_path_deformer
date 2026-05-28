@@ -213,6 +213,7 @@ public:
     dynamic_acc_path_extra_margin_ =
       declare_parameter<double>("dynamic_acc_path_extra_margin", 0.0);
     dynamic_acc_ttl_ms_ = declare_parameter<int>("dynamic_acc_ttl_ms", 500);
+    dynamic_acc_hysteresis_ms_ = declare_parameter<int>("dynamic_acc_hysteresis_ms", 300);
     dynamic_acc_front_yaw_limit_ = declare_parameter<double>("dynamic_acc_front_yaw_limit", 0.60);
     dynamic_acc_lateral_width_ = declare_parameter<double>("dynamic_acc_lateral_width", 0.60);
     dynamic_acc_min_distance_ = declare_parameter<double>("dynamic_acc_min_distance", 0.80);
@@ -2329,33 +2330,61 @@ private:
 
   void updateDynamicAccWindowState(int search_start, int search_end)
   {
+    const auto now_time = std::chrono::steady_clock::now();
     dynamic_acc_path_window_active_ = false;
+    dynamic_acc_hysteresis_active_ = false;
     dynamic_acc_active_point_indices_.clear();
-    if (!dynamic_acc_enabled_ || !dynamicAccAllowedByObstacleMode() || !dynamicPointcloudFresh()) {
+    const bool mode_allowed = dynamicAccAllowedByObstacleMode();
+    if (!dynamic_acc_enabled_ || !mode_allowed) {
+      dynamic_acc_limit_points_.clear();
       return;
     }
 
-    for (size_t i = 0; i < dynamic_points_.size(); ++i) {
-      const auto & point = dynamic_points_[i];
-      if (!dynamicPointPassesAccGeometry(point)) {
-        continue;
-      }
-      if (!dynamic_acc_requires_path_window_ ||
-          dynamicPointNearPathWindow(point, search_start, search_end))
-      {
-        dynamic_acc_active_point_indices_.push_back(i);
+    std::vector<DynamicPoint> active_points;
+    active_points.reserve(dynamic_points_.size());
+    if (dynamicPointcloudFresh()) {
+      for (size_t i = 0; i < dynamic_points_.size(); ++i) {
+        const auto & point = dynamic_points_[i];
+        if (!dynamicPointPassesAccGeometry(point)) {
+          continue;
+        }
+        if (!dynamic_acc_requires_path_window_ ||
+            dynamicPointNearPathWindow(point, search_start, search_end))
+        {
+          dynamic_acc_active_point_indices_.push_back(i);
+          active_points.push_back(point);
+        }
       }
     }
 
-    dynamic_acc_path_window_active_ = !dynamic_acc_active_point_indices_.empty();
+    if (!active_points.empty()) {
+      dynamic_acc_path_window_active_ = true;
+      dynamic_acc_limit_points_ = std::move(active_points);
+      last_dynamic_acc_active_time_ = now_time;
+      return;
+    }
+
+    const int hysteresis_ms = std::max(0, dynamic_acc_hysteresis_ms_);
+    if (hysteresis_ms > 0 && !dynamic_acc_limit_points_.empty()) {
+      const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now_time - last_dynamic_acc_active_time_);
+      if (age.count() <= hysteresis_ms) {
+        dynamic_acc_path_window_active_ = true;
+        dynamic_acc_hysteresis_active_ = true;
+        return;
+      }
+    }
+
+    dynamic_acc_limit_points_.clear();
   }
 
   double applyDynamicAccVelocityLimit(double nominal_speed) const
   {
     if (nominal_speed <= 0.0 ||
+        !dynamic_acc_enabled_ ||
         !dynamic_acc_path_window_active_ ||
         !dynamicAccAllowedByObstacleMode() ||
-        !dynamicPointcloudFresh())
+        dynamic_acc_limit_points_.empty())
     {
       return nominal_speed;
     }
@@ -2366,12 +2395,7 @@ private:
     const double min_speed = std::max(0.0, dynamic_acc_min_speed_);
     double limited_speed = nominal_speed;
 
-    for (const size_t index : dynamic_acc_active_point_indices_) {
-      if (index >= dynamic_points_.size()) {
-        continue;
-      }
-
-      const auto & point = dynamic_points_[index];
+    for (const auto & point : dynamic_acc_limit_points_) {
       if (!dynamicPointPassesAccGeometry(point)) {
         continue;
       }
@@ -2576,6 +2600,29 @@ private:
       markers.markers.push_back(marker);
     }
 
+    if (dynamic_acc_hysteresis_active_) {
+      for (const auto & point : dynamic_acc_limit_points_) {
+        visualization_msgs::msg::Marker marker;
+        marker.header = clear.header;
+        marker.ns = "dynamic_acc_held";
+        marker.id = id++;
+        marker.type = visualization_msgs::msg::Marker::SPHERE;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.position.x = point.x;
+        marker.pose.position.y = point.y;
+        marker.pose.position.z = 0.32;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = 0.22;
+        marker.scale.y = marker.scale.x;
+        marker.scale.z = marker.scale.x;
+        marker.color.a = 0.8;
+        marker.color.r = 1.0;
+        marker.color.g = 0.55;
+        marker.color.b = 0.0;
+        markers.markers.push_back(marker);
+      }
+    }
+
     visualization_msgs::msg::Marker text;
     text.header = clear.header;
     text.ns = "dynamic_acc_status";
@@ -2601,7 +2648,9 @@ private:
       << "ACC " << (dynamic_acc_path_window_active_ ? "ON" : "OFF")
       << " mode=" << obstacle_mode_
       << " fresh=" << (fresh ? 1 : 0)
-      << " active_points=" << dynamic_acc_active_point_indices_.size();
+      << " active_points=" << dynamic_acc_active_point_indices_.size()
+      << " limit_points=" << dynamic_acc_limit_points_.size()
+      << " hold=" << (dynamic_acc_hysteresis_active_ ? 1 : 0);
     text.text = oss.str();
 
     markers.markers.push_back(text);
@@ -3377,11 +3426,14 @@ private:
   bool dynamic_acc_marker_enabled_{true};
   bool dynamic_acc_requires_path_window_{true};
   bool dynamic_acc_path_window_active_{false};
+  bool dynamic_acc_hysteresis_active_{false};
   std::vector<size_t> dynamic_acc_active_point_indices_;
+  std::vector<DynamicPoint> dynamic_acc_limit_points_;
   double dynamic_acc_path_lateral_width_{0.60};
   double dynamic_acc_path_forward_distance_{1.00};
   double dynamic_acc_path_extra_margin_{0.0};
   int dynamic_acc_ttl_ms_{500};
+  int dynamic_acc_hysteresis_ms_{300};
   double dynamic_acc_front_yaw_limit_{0.60};
   double dynamic_acc_lateral_width_{0.60};
   double dynamic_acc_min_distance_{0.80};
@@ -3446,6 +3498,8 @@ private:
   std::chrono::steady_clock::time_point last_scan_overlay_time_{
     std::chrono::steady_clock::time_point::min()};
   std::chrono::steady_clock::time_point last_dynamic_pointcloud_time_{
+    std::chrono::steady_clock::time_point::min()};
+  std::chrono::steady_clock::time_point last_dynamic_acc_active_time_{
     std::chrono::steady_clock::time_point::min()};
 
   bool map_info_logged_{false};
