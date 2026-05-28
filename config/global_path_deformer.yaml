@@ -75,13 +75,15 @@ global_path_deformer:
     deformation_tail_waypoints: 8
     gap_tolerance: 2
     max_collision_cluster_span: 8
+
     closed_loop_path: true
     closest_index_backward_search_waypoints: 5
     closest_index_forward_search_waypoints: 45
     closest_index_reset_distance: 1.20
+
     use_full_path_search: false
-    collision_search_start_ahead_waypoints: 0
-    collision_search_lookahead_waypoints: 178
+    collision_search_start_ahead_waypoints: 3
+    collision_search_lookahead_waypoints: 60
     dynamic_acc_search_start_ahead_waypoints: 3
     dynamic_acc_search_lookahead_waypoints: 80
     deformation_hold_cycles: -1
@@ -107,5 +109,5 @@ global_path_deformer:
     parallel_min_items: 16
 
     metrics_enabled: true
-    metrics_csv_path: /home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv
+    metrics_csv_path: /home/rcv/global_path_deformer/metrics/global_path_deformer_metrics.csv
     metrics_flush_period: 20

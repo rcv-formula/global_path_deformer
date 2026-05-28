@@ -314,7 +314,12 @@ private:
   {
     if (msg->poses.empty()) return;
 
-    path_frame_id_ = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
+    const std::string incoming_frame_id = msg->header.frame_id.empty() ? "map" : msg->header.frame_id;
+    if (isSameGlobalPath(*msg, incoming_frame_id)) {
+      return;
+    }
+
+    path_frame_id_ = incoming_frame_id;
     original_global_path_.clear();
     original_global_path_.reserve(msg->poses.size());
 
@@ -340,6 +345,28 @@ private:
         global_path_.size(),
         path_frame_id_.c_str());
     }
+  }
+
+  bool isSameGlobalPath(const nav_msgs::msg::Path & msg, const std::string & frame_id) const
+  {
+    if (!path_received_ || frame_id != path_frame_id_ ||
+        msg.poses.size() != original_global_path_.size()) {
+      return false;
+    }
+
+    constexpr double path_epsilon = 1e-6;
+    for (size_t i = 0; i < msg.poses.size(); ++i) {
+      const auto & pose = msg.poses[i].pose.position;
+      const auto & waypoint = original_global_path_[i];
+      if (std::abs(pose.x - waypoint.x) > path_epsilon ||
+          std::abs(pose.y - waypoint.y) > path_epsilon ||
+          std::abs(pose.z - waypoint.v) > path_epsilon)
+      {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   void cb_odom(const nav_msgs::msg::Odometry::SharedPtr msg)
