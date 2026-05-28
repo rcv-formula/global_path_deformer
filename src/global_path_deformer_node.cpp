@@ -105,6 +105,8 @@ struct ProfileCounters
   std::atomic<uint64_t> segment_collision_calls{0};
   std::atomic<uint64_t> deformation_trigger_collision_calls{0};
   std::atomic<uint64_t> footprint_collision_calls{0};
+  std::atomic<uint64_t> footprint_collision_cache_hits{0};
+  std::atomic<uint64_t> footprint_collision_cache_misses{0};
   std::atomic<uint64_t> scan_trigger_collision_calls{0};
   std::atomic<uint64_t> map_trigger_collision_calls{0};
   std::atomic<uint64_t> shifted_waypoint_calls{0};
@@ -123,9 +125,50 @@ struct ProfileCounters
     segment_collision_calls.store(0, std::memory_order_relaxed);
     deformation_trigger_collision_calls.store(0, std::memory_order_relaxed);
     footprint_collision_calls.store(0, std::memory_order_relaxed);
+    footprint_collision_cache_hits.store(0, std::memory_order_relaxed);
+    footprint_collision_cache_misses.store(0, std::memory_order_relaxed);
     scan_trigger_collision_calls.store(0, std::memory_order_relaxed);
     map_trigger_collision_calls.store(0, std::memory_order_relaxed);
     shifted_waypoint_calls.store(0, std::memory_order_relaxed);
+  }
+};
+
+struct FootprintCollisionCacheKey
+{
+  int mx{0};
+  int my{0};
+  int sub_x{0};
+  int sub_y{0};
+  int yaw_bin{0};
+
+  bool operator==(const FootprintCollisionCacheKey & other) const
+  {
+    return mx == other.mx &&
+           my == other.my &&
+           sub_x == other.sub_x &&
+           sub_y == other.sub_y &&
+           yaw_bin == other.yaw_bin;
+  }
+};
+
+struct FootprintCollisionCacheKeyHash
+{
+  size_t operator()(const FootprintCollisionCacheKey & key) const
+  {
+    size_t seed = 0;
+    hashCombine(seed, key.mx);
+    hashCombine(seed, key.my);
+    hashCombine(seed, key.sub_x);
+    hashCombine(seed, key.sub_y);
+    hashCombine(seed, key.yaw_bin);
+    return seed;
+  }
+
+private:
+  template<typename T>
+  static void hashCombine(size_t & seed, const T & value)
+  {
+    seed ^= std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
   }
 };
 
@@ -340,10 +383,50 @@ public:
   }
 
 private:
+  void rebuildInflatedMap()
+  {
+    const int width = static_cast<int>(map_.info.width);
+    const int height = static_cast<int>(map_.info.height);
+    const double res = map_.info.resolution;
+
+    if (res <= 0.0 || width <= 0 || height <= 0) {
+      inflated_map_valid_ = false;
+      return;
+    }
+
+    inflated_map_.assign(static_cast<size_t>(width * height), 0u);
+
+    const double bounding_radius = footprintBoundingRadius();
+    const int r_cell = static_cast<int>(std::ceil(bounding_radius / res));
+    const double r2 = (bounding_radius / res) * (bounding_radius / res);
+
+    for (int oy = 0; oy < height; ++oy) {
+      for (int ox = 0; ox < width; ++ox) {
+        if (!isOccupiedCost(getCost(ox, oy))) continue;
+        for (int dy = -r_cell; dy <= r_cell; ++dy) {
+          for (int dx = -r_cell; dx <= r_cell; ++dx) {
+            if (static_cast<double>(dx * dx + dy * dy) > r2) continue;
+            const int nx = ox + dx;
+            const int ny = oy + dy;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            inflated_map_[static_cast<size_t>(ny * width + nx)] = 1u;
+          }
+        }
+      }
+    }
+
+    inflated_map_valid_ = true;
+    RCLCPP_INFO(
+      get_logger(),
+      "inflated map built: %dx%d cells, bounding_radius=%.3fm (%d cells)",
+      width, height, bounding_radius, r_cell);
+  }
+
   void cb_map(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   {
     map_ = *msg;
     map_received_ = true;
+    rebuildInflatedMap();
 
     if (!map_info_logged_ ||
         last_map_width_ != map_.info.width ||
@@ -729,6 +812,52 @@ private:
     return std::hypot(half_length, half_width);
   }
 
+  FootprintCollisionCacheKey footprintCollisionCacheKey(
+    int mx,
+    int my,
+    double x,
+    double y,
+    double yaw) const
+  {
+    const double res = map_.info.resolution;
+    const double origin_x = map_.info.origin.position.x;
+    const double origin_y = map_.info.origin.position.y;
+    const double cell_x0 = origin_x + static_cast<double>(mx) * res;
+    const double cell_y0 = origin_y + static_cast<double>(my) * res;
+    const double frac_x = std::clamp((x - cell_x0) / res, 0.0, std::nextafter(1.0, 0.0));
+    const double frac_y = std::clamp((y - cell_y0) / res, 0.0, std::nextafter(1.0, 0.0));
+
+    double yaw_mod = std::isfinite(yaw) ? std::fmod(yaw, M_PI) : 0.0;
+    if (yaw_mod < 0.0) {
+      yaw_mod += M_PI;
+    }
+    const int yaw_bin = std::min(
+      footprint_cache_yaw_bins_ - 1,
+      static_cast<int>(
+        std::floor(yaw_mod / M_PI * static_cast<double>(footprint_cache_yaw_bins_))));
+
+    return FootprintCollisionCacheKey{
+      mx,
+      my,
+      static_cast<int>(std::floor(frac_x * static_cast<double>(footprint_cache_subcells_))),
+      static_cast<int>(std::floor(frac_y * static_cast<double>(footprint_cache_subcells_))),
+      yaw_bin};
+  }
+
+  double footprintCollisionCachePadding() const
+  {
+    const double res = map_.info.resolution;
+    const double position_padding =
+      std::sqrt(2.0) * res / static_cast<double>(footprint_cache_subcells_);
+    const double margin = std::max(0.0, footprint_margin_);
+    const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
+    const double half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
+    const double footprint_radius = std::hypot(half_length, half_width);
+    const double yaw_padding =
+      footprint_radius * std::sin(M_PI / static_cast<double>(footprint_cache_yaw_bins_));
+    return position_padding + yaw_padding;
+  }
+
   bool scanConfirmsMapOccupied(double x, double y) const
   {
     if (!map_occupied_requires_scan_confirmation_) return true;
@@ -750,13 +879,29 @@ private:
     int my = 0;
     if (!worldToMap(x, y, mx, my)) return true;
 
+    // Fast path: if no obstacle falls within the bounding circle, the oriented
+    // footprint is also clear — skip the 361-cell loop entirely.
+    if (inflated_map_valid_) {
+      if (!inflated_map_[static_cast<size_t>(my * static_cast<int>(map_.info.width) + mx)]) {
+        return false;
+      }
+    }
+
     const double res = map_.info.resolution;
     if (res <= 0.0) return true;
 
-    const double margin = std::max(0.0, footprint_margin_);
+    const auto cache_key = footprintCollisionCacheKey(mx, my, x, y, yaw);
+    const auto cached = footprint_collision_cache_.find(cache_key);
+    if (cached != footprint_collision_cache_.end()) {
+      profile_counters_.footprint_collision_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      return cached->second;
+    }
+    profile_counters_.footprint_collision_cache_misses.fetch_add(1, std::memory_order_relaxed);
+
+    const double margin = std::max(0.0, footprint_margin_) + footprintCollisionCachePadding();
     const double half_length = std::max(vehicle_length_ * 0.5, robot_radius_) + margin;
     const double half_width = std::max(vehicle_width_ * 0.5, robot_radius_) + margin;
-    const int r_cell = static_cast<int>(std::ceil(footprintBoundingRadius() / res));
+    const int r_cell = static_cast<int>(std::ceil(std::hypot(half_length, half_width) / res));
     const double cos_yaw = std::cos(yaw);
     const double sin_yaw = std::sin(yaw);
 
@@ -777,10 +922,14 @@ private:
         }
 
         const int cost = getCost(cell_mx, cell_my);
-        if (isOccupiedCost(cost)) return true;
+        if (isOccupiedCost(cost)) {
+          footprint_collision_cache_.emplace(cache_key, true);
+          return true;
+        }
       }
     }
 
+    footprint_collision_cache_.emplace(cache_key, false);
     return false;
   }
 
@@ -1036,6 +1185,9 @@ private:
   {
     profile_counters_.shifted_waypoint_calls.fetch_add(1, std::memory_order_relaxed);
     Waypoint wp = global_path_[i];
+    double nx = 0.0;
+    double ny = 0.0;
+    bool normal_computed = false;
 
     for (const auto & deformation : deformations) {
       if (!deformation.active() ||
@@ -1043,9 +1195,10 @@ private:
         continue;
       }
 
-      double nx = 0.0;
-      double ny = 0.0;
-      computeNormal(i, nx, ny);
+      if (!normal_computed) {
+        computeNormal(i, nx, ny);
+        normal_computed = true;
+      }
       const double beta = blendingWeight(i, deformation.window);
       wp.x += beta * deformation.shift * nx;
       wp.y += beta * deformation.shift * ny;
@@ -1808,14 +1961,16 @@ private:
     return map_signed_sum > 0.0 ? -1 : 1;
   }
 
-  bool pathRangeCollision(
-    const std::vector<PathDeformation> & deformations,
+  // Core traversal: calls get_waypoint(i) instead of hardcoding shiftedWaypoint.
+  // Lets callers compose existing deformations + a candidate without copying a vector.
+  template<typename WaypointFn>
+  bool pathRangeCollisionImpl(
+    WaypointFn get_waypoint,
     int first,
     int last,
     bool include_closing_segment,
-    bool use_deformation_trigger = false) const
+    bool use_deformation_trigger) const
   {
-    profile_counters_.path_range_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (global_path_.empty()) return false;
 
     if (!closed_loop_path_) {
@@ -1827,7 +1982,7 @@ private:
       last = wrapIndex(last);
     }
 
-    const Waypoint first_wp = shiftedWaypoint(first, deformations);
+    const Waypoint first_wp = get_waypoint(first);
     Waypoint prev = first_wp;
     int prev_index = first;
     if (use_deformation_trigger) {
@@ -1839,7 +1994,7 @@ private:
     if (closed_loop_path_) {
       int i = wrapIndex(first + 1);
       for (size_t steps = 1; steps < global_path_.size(); ++steps) {
-        const Waypoint curr = shiftedWaypoint(i, deformations);
+        const Waypoint curr = get_waypoint(i);
         if (segmentCollision(prev.x, prev.y, curr.x, curr.y, use_deformation_trigger)) return true;
         prev = curr;
         prev_index = i;
@@ -1848,7 +2003,7 @@ private:
       }
     } else {
       for (int i = first + 1; i <= last; ++i) {
-        const Waypoint curr = shiftedWaypoint(i, deformations);
+        const Waypoint curr = get_waypoint(i);
         if (segmentCollision(prev.x, prev.y, curr.x, curr.y, use_deformation_trigger)) return true;
         prev = curr;
         prev_index = i;
@@ -1864,6 +2019,19 @@ private:
     return false;
   }
 
+  bool pathRangeCollision(
+    const std::vector<PathDeformation> & deformations,
+    int first,
+    int last,
+    bool include_closing_segment,
+    bool use_deformation_trigger = false) const
+  {
+    profile_counters_.path_range_collision_calls.fetch_add(1, std::memory_order_relaxed);
+    return pathRangeCollisionImpl(
+      [&](int i) { return shiftedWaypoint(i, deformations); },
+      first, last, include_closing_segment, use_deformation_trigger);
+  }
+
   bool correctedWindowCollision(
     const DeformationWindow & window,
     double shift,
@@ -1873,9 +2041,6 @@ private:
     profile_counters_.corrected_window_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (!window.active()) return false;
 
-    std::vector<PathDeformation> deformations = existing_deformations;
-    deformations.push_back(PathDeformation{window, shift});
-
     const int first = closed_loop_path_ ?
       wrapIndex(window.start - 1) :
       std::max(0, window.start - 1);
@@ -1883,7 +2048,25 @@ private:
       wrapIndex(window.end + 1) :
       std::min(static_cast<int>(global_path_.size()) - 1, window.end + 1);
 
-    return pathRangeCollision(deformations, first, last, false, use_deformation_trigger);
+    // Apply existing deformations + candidate inline — no heap allocation.
+    const PathDeformation candidate{window, shift};
+    return pathRangeCollisionImpl(
+      [&](int i) {
+        Waypoint wp = global_path_[i];
+        double nx = 0.0;
+        double ny = 0.0;
+        bool normal_computed = false;
+        auto apply = [&](const PathDeformation & d) {
+          if (!d.active() || !indexInForwardRange(i, d.window.start, d.window.end)) return;
+          if (!normal_computed) { computeNormal(i, nx, ny); normal_computed = true; }
+          wp.x += blendingWeight(i, d.window) * d.shift * nx;
+          wp.y += blendingWeight(i, d.window) * d.shift * ny;
+        };
+        for (const auto & d : existing_deformations) apply(d);
+        apply(candidate);
+        return wp;
+      },
+      first, last, false, use_deformation_trigger);
   }
 
   bool deformationsCollision(
@@ -1892,12 +2075,23 @@ private:
   {
     profile_counters_.deformations_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (deformations.empty()) return false;
-    return pathRangeCollision(
-      deformations,
-      0,
-      static_cast<int>(global_path_.size()) - 1,
-      closed_loop_path_,
-      use_deformation_trigger);
+    // Only check each deformation's window region instead of the entire path.
+    // Waypoints outside any window are unshifted original path, which is safe by assumption.
+    // All deformations are still passed to pathRangeCollision so overlapping windows
+    // receive correct combined shifts.
+    for (const auto & d : deformations) {
+      if (!d.active()) continue;
+      const int first = closed_loop_path_ ?
+        wrapIndex(d.window.start - 1) :
+        std::max(0, d.window.start - 1);
+      const int last = closed_loop_path_ ?
+        wrapIndex(d.window.end + 1) :
+        std::min(static_cast<int>(global_path_.size()) - 1, d.window.end + 1);
+      if (pathRangeCollision(deformations, first, last, false, use_deformation_trigger)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   double refineSafeShift(
@@ -2680,6 +2874,7 @@ private:
       << "safe_shift_successes,safe_shift_failures,shift_candidates_tested,"
       << "corrected_window_collision_calls,deformations_collision_calls,path_range_collision_calls,"
       << "segment_collision_calls,deformation_trigger_collision_calls,footprint_collision_calls,"
+      << "footprint_collision_cache_hits,footprint_collision_cache_misses,"
       << "scan_trigger_collision_calls,map_trigger_collision_calls,shifted_waypoint_calls,"
       << "deformation_detail,failure_detail\n";
     metrics_file_.flush();
@@ -2799,6 +2994,8 @@ private:
       << profile_counters_.segment_collision_calls.load(std::memory_order_relaxed) << ','
       << profile_counters_.deformation_trigger_collision_calls.load(std::memory_order_relaxed) << ','
       << profile_counters_.footprint_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.footprint_collision_cache_hits.load(std::memory_order_relaxed) << ','
+      << profile_counters_.footprint_collision_cache_misses.load(std::memory_order_relaxed) << ','
       << profile_counters_.scan_trigger_collision_calls.load(std::memory_order_relaxed) << ','
       << profile_counters_.map_trigger_collision_calls.load(std::memory_order_relaxed) << ','
       << profile_counters_.shifted_waypoint_calls.load(std::memory_order_relaxed) << ','
@@ -2822,6 +3019,7 @@ private:
   {
     process_profile_ = ProcessProfile{};
     profile_counters_.reset();
+    footprint_collision_cache_.clear();
   }
 
   std::string makeDeformationDetail(const std::vector<PathDeformation> & deformations) const
@@ -3203,6 +3401,14 @@ private:
   std::ofstream metrics_file_;
   ProcessProfile process_profile_;
   mutable ProfileCounters profile_counters_;
+  static constexpr int footprint_cache_subcells_{8};
+  static constexpr int footprint_cache_yaw_bins_{72};
+  mutable std::unordered_map<
+    FootprintCollisionCacheKey,
+    bool,
+    FootprintCollisionCacheKeyHash> footprint_collision_cache_;
+  std::vector<uint8_t> inflated_map_;
+  bool inflated_map_valid_{false};
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_map_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_path_;

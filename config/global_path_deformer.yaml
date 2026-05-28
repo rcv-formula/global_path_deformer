@@ -83,7 +83,7 @@ global_path_deformer:
 
     use_full_path_search: false
     collision_search_start_ahead_waypoints: 3
-    collision_search_lookahead_waypoints: 60
+    collision_search_lookahead_waypoints: 80
     dynamic_acc_search_start_ahead_waypoints: 3
     dynamic_acc_search_lookahead_waypoints: 80
     deformation_hold_cycles: -1
