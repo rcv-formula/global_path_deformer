@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -72,6 +73,60 @@ struct DynamicPoint
   uint32_t track_id{0};
   double relative_speed{0.0};
   double relative_yaw{0.0};
+};
+
+struct ProcessProfile
+{
+  double range_ms{0.0};
+  double hold_check_ms{0.0};
+  double release_check_ms{0.0};
+  double detect_collision_ms{0.0};
+  double cluster_ms{0.0};
+  double shift_sign_ms{0.0};
+  double find_safe_shift_ms{0.0};
+  double partial_update_ms{0.0};
+  double merge_ms{0.0};
+  double smooth_ms{0.0};
+  double make_path_ms{0.0};
+  double publish_ms{0.0};
+};
+
+struct ProfileCounters
+{
+  std::atomic<uint64_t> estimate_shift_sign_calls{0};
+  std::atomic<uint64_t> estimate_side_clearance_calls{0};
+  std::atomic<uint64_t> safe_shift_calls{0};
+  std::atomic<uint64_t> safe_shift_successes{0};
+  std::atomic<uint64_t> safe_shift_failures{0};
+  std::atomic<uint64_t> shift_candidates_tested{0};
+  std::atomic<uint64_t> corrected_window_collision_calls{0};
+  std::atomic<uint64_t> deformations_collision_calls{0};
+  std::atomic<uint64_t> path_range_collision_calls{0};
+  std::atomic<uint64_t> segment_collision_calls{0};
+  std::atomic<uint64_t> deformation_trigger_collision_calls{0};
+  std::atomic<uint64_t> footprint_collision_calls{0};
+  std::atomic<uint64_t> scan_trigger_collision_calls{0};
+  std::atomic<uint64_t> map_trigger_collision_calls{0};
+  std::atomic<uint64_t> shifted_waypoint_calls{0};
+
+  void reset()
+  {
+    estimate_shift_sign_calls.store(0, std::memory_order_relaxed);
+    estimate_side_clearance_calls.store(0, std::memory_order_relaxed);
+    safe_shift_calls.store(0, std::memory_order_relaxed);
+    safe_shift_successes.store(0, std::memory_order_relaxed);
+    safe_shift_failures.store(0, std::memory_order_relaxed);
+    shift_candidates_tested.store(0, std::memory_order_relaxed);
+    corrected_window_collision_calls.store(0, std::memory_order_relaxed);
+    deformations_collision_calls.store(0, std::memory_order_relaxed);
+    path_range_collision_calls.store(0, std::memory_order_relaxed);
+    segment_collision_calls.store(0, std::memory_order_relaxed);
+    deformation_trigger_collision_calls.store(0, std::memory_order_relaxed);
+    footprint_collision_calls.store(0, std::memory_order_relaxed);
+    scan_trigger_collision_calls.store(0, std::memory_order_relaxed);
+    map_trigger_collision_calls.store(0, std::memory_order_relaxed);
+    shifted_waypoint_calls.store(0, std::memory_order_relaxed);
+  }
 };
 
 class GlobalPathDeformer : public rclcpp::Node
@@ -687,6 +742,7 @@ private:
 
   bool isFootprintCollision(double x, double y, double yaw) const
   {
+    profile_counters_.footprint_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (isScanBoundaryCollision(x, y, yaw)) return true;
     if (!map_collision_enabled_) return false;
 
@@ -792,6 +848,7 @@ private:
 
   bool isScanTriggerCollision(double x, double y, double yaw) const
   {
+    profile_counters_.scan_trigger_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (!scan_overlay_trigger_enabled_ || !scanOverlayFresh()) return false;
 
     const double margin = std::max(0.0, footprint_margin_ + scan_overlay_trigger_extra_margin_);
@@ -826,6 +883,7 @@ private:
 
   bool isMapTriggerCollision(double x, double y, double yaw) const
   {
+    profile_counters_.map_trigger_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (!map_collision_enabled_ || !map_trigger_enabled_ || !map_received_) return false;
 
     int mx = 0;
@@ -885,6 +943,7 @@ private:
 
   bool isDeformationTriggerCollision(double x, double y, double yaw) const
   {
+    profile_counters_.deformation_trigger_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (isScanTriggerCollision(x, y, yaw)) return true;
     if (isMapTriggerCollision(x, y, yaw)) return true;
     return isFootprintCollision(x, y, yaw);
@@ -975,6 +1034,7 @@ private:
 
   Waypoint shiftedWaypoint(int i, const std::vector<PathDeformation> & deformations) const
   {
+    profile_counters_.shifted_waypoint_calls.fetch_add(1, std::memory_order_relaxed);
     Waypoint wp = global_path_[i];
 
     for (const auto & deformation : deformations) {
@@ -1001,6 +1061,7 @@ private:
     double y1,
     bool use_deformation_trigger = false) const
   {
+    profile_counters_.segment_collision_calls.fetch_add(1, std::memory_order_relaxed);
     const double length = std::hypot(x1 - x0, y1 - y0);
     const int steps = std::max(1, static_cast<int>(std::ceil(length / effectiveCollisionCheckStep())));
     const double yaw = std::atan2(y1 - y0, x1 - x0);
@@ -1586,6 +1647,7 @@ private:
 
   double estimateSideClearance(int is, int ie, int sign) const
   {
+    profile_counters_.estimate_side_clearance_calls.fetch_add(1, std::memory_order_relaxed);
     if (sign == 0 || global_path_.empty()) return 0.0;
 
     const double step = std::max(0.05, effectiveCollisionCheckStep());
@@ -1630,6 +1692,7 @@ private:
 
   int estimateShiftSign(int is, int ie) const
   {
+    profile_counters_.estimate_shift_sign_calls.fetch_add(1, std::memory_order_relaxed);
     const int clearance_sign = estimateClearanceShiftSign(is, ie);
     if (clearance_sign != 0) {
       return clearance_sign;
@@ -1752,6 +1815,7 @@ private:
     bool include_closing_segment,
     bool use_deformation_trigger = false) const
   {
+    profile_counters_.path_range_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (global_path_.empty()) return false;
 
     if (!closed_loop_path_) {
@@ -1806,6 +1870,7 @@ private:
     const std::vector<PathDeformation> & existing_deformations = {},
     bool use_deformation_trigger = false) const
   {
+    profile_counters_.corrected_window_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (!window.active()) return false;
 
     std::vector<PathDeformation> deformations = existing_deformations;
@@ -1825,6 +1890,7 @@ private:
     const std::vector<PathDeformation> & deformations,
     bool use_deformation_trigger = false) const
   {
+    profile_counters_.deformations_collision_calls.fetch_add(1, std::memory_order_relaxed);
     if (deformations.empty()) return false;
     return pathRangeCollision(
       deformations,
@@ -1900,6 +1966,7 @@ private:
     double & shift,
     std::string & failure_reason) const
   {
+    profile_counters_.safe_shift_calls.fetch_add(1, std::memory_order_relaxed);
     failure_reason.clear();
     if (shift_step_ <= 0.0) {
       shift = 0.0;
@@ -1929,12 +1996,14 @@ private:
           static_cast<double>(sign) * static_cast<double>(k) * shift_step_,
           -max_shift_,
           max_shift_);
+        profile_counters_.shift_candidates_tested.fetch_add(1, std::memory_order_relaxed);
         if (!correctedWindowCollision(window, d, existing_deformations)) {
           const double safe_abs_shift = std::abs(d);
           const double unsafe_abs_shift = std::min(
             safe_abs_shift,
             static_cast<double>(k - 1) * shift_step_);
           shift = refineSafeShift(window, sign, unsafe_abs_shift, safe_abs_shift, existing_deformations);
+          profile_counters_.safe_shift_successes.fetch_add(1, std::memory_order_relaxed);
           return true;
         }
       }
@@ -1944,6 +2013,7 @@ private:
     failure_reason = allow_opposite_shift_ ?
       "window_collision_all_shift_candidates_both_directions" :
       "window_collision_all_shift_candidates";
+    profile_counters_.safe_shift_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
@@ -2347,7 +2417,12 @@ private:
 
   void process()
   {
+    resetProfiling();
     const auto process_start = std::chrono::steady_clock::now();
+    auto add_stage_ms =
+      [this](double & target, const std::chrono::steady_clock::time_point & start) {
+        target += elapsedProcessMs(start);
+      };
 
     const bool map_ready = map_received_ || !map_collision_enabled_;
     if (!map_ready || !path_received_ || global_path_.size() < 3) {
@@ -2374,11 +2449,13 @@ private:
     int closest_index = 0;
     int search_start = 0;
     int search_end = static_cast<int>(global_path_.size()) - 1;
+    auto stage_start = std::chrono::steady_clock::now();
     getCollisionSearchRange(closest_index, search_start, search_end);
     int dynamic_acc_search_start = search_start;
     int dynamic_acc_search_end = search_end;
     getDynamicAccSearchRange(closest_index, dynamic_acc_search_start, dynamic_acc_search_end);
     updateDynamicAccWindowState(dynamic_acc_search_start, dynamic_acc_search_end);
+    add_stage_ms(process_profile_.range_ms, stage_start);
 
     std::vector<int> collision_indices;
     std::vector<PathDeformation> deformations;
@@ -2387,18 +2464,27 @@ private:
     size_t failed_clusters = 0;
     std::vector<std::string> failure_details;
 
-    if (canHoldActiveDeformation(search_start, active_deformation_hold_uses_trigger_)) {
+    stage_start = std::chrono::steady_clock::now();
+    const bool can_hold_active =
+      canHoldActiveDeformation(search_start, active_deformation_hold_uses_trigger_);
+    add_stage_ms(process_profile_.hold_check_ms, stage_start);
+
+    if (can_hold_active) {
       deformations = active_deformations_;
       active_collision_grace_cycles_ = 0;
       ++active_clear_cycles_;
       state = "holding";
       logHoldState(closest_index, search_start, search_end, "active path remains collision-free");
     } else {
+      stage_start = std::chrono::steady_clock::now();
       collision_indices = detectCollisionIndices(search_start, search_end);
+      add_stage_ms(process_profile_.detect_collision_ms, stage_start);
     }
 
     if (state != "holding" && !collision_indices.empty()) {
+      stage_start = std::chrono::steady_clock::now();
       const auto clusters = splitLargeCollisionClusters(getCollisionClusters(collision_indices));
+      add_stage_ms(process_profile_.cluster_ms, stage_start);
       cluster_count = clusters.size();
 
       int min_window_start = use_full_path_search_ ? 0 : search_start;
@@ -2413,11 +2499,15 @@ private:
           continue;
         }
 
+        stage_start = std::chrono::steady_clock::now();
         const int shift_sign = estimateShiftSign(ia, ib);
+        add_stage_ms(process_profile_.shift_sign_ms, stage_start);
         double d_req = 0.0;
         std::string failure_reason;
+        stage_start = std::chrono::steady_clock::now();
         bool safe_shift_found =
           findSafeShift(window, shift_sign, deformations, d_req, failure_reason);
+        add_stage_ms(process_profile_.find_safe_shift_ms, stage_start);
         if (safe_shift_found) {
           deformations.push_back(PathDeformation{window, d_req});
           min_window_start = window.end + 1;
@@ -2427,7 +2517,12 @@ private:
         }
       }
 
-      if (!deformations.empty() && shouldKeepActiveOverPartialUpdate(failed_clusters)) {
+      stage_start = std::chrono::steady_clock::now();
+      const bool keep_active_over_partial =
+        !deformations.empty() && shouldKeepActiveOverPartialUpdate(failed_clusters);
+      add_stage_ms(process_profile_.partial_update_ms, stage_start);
+
+      if (keep_active_over_partial) {
         deformations = active_deformations_;
         ++active_collision_grace_cycles_;
         ++active_clear_cycles_;
@@ -2438,8 +2533,12 @@ private:
           search_end,
           "keeping previous deformation over partial update");
       } else if (!deformations.empty()) {
+        stage_start = std::chrono::steady_clock::now();
         deformations = mergeReusableActiveDeformations(deformations, search_start);
+        add_stage_ms(process_profile_.merge_ms, stage_start);
+        stage_start = std::chrono::steady_clock::now();
         deformations = smoothWithActiveDeformations(deformations);
+        add_stage_ms(process_profile_.smooth_ms, stage_start);
         active_deformation_valid_ = true;
         active_deformations_ = deformations;
         active_clear_cycles_ = 0;
@@ -2454,42 +2553,61 @@ private:
           search_start,
           search_end,
           deformations);
-      } else if (canHoldActiveDeformation(search_start, active_deformation_hold_uses_trigger_)) {
+      } else {
+        stage_start = std::chrono::steady_clock::now();
+        const bool can_hold_after_failed_shift =
+          canHoldActiveDeformation(search_start, active_deformation_hold_uses_trigger_);
+        add_stage_ms(process_profile_.hold_check_ms, stage_start);
+
+        if (can_hold_after_failed_shift) {
+          deformations = active_deformations_;
+          active_collision_grace_cycles_ = 0;
+          ++active_clear_cycles_;
+          state = "holding";
+          logHoldState(closest_index, search_start, search_end, "safe shift search failed");
+        } else {
+          state = "unsafe";
+          if (hasActiveDeformation()) {
+            deformations = active_deformations_;
+            ++active_clear_cycles_;
+          } else {
+            clearActiveDeformation();
+          }
+          logUnsafeState(
+            collision_indices.size(),
+            cluster_count,
+            closest_index,
+            search_start,
+            search_end,
+            !deformations.empty());
+        }
+      }
+    } else if (state != "holding") {
+      stage_start = std::chrono::steady_clock::now();
+      const bool can_hold_clear = canHoldActiveDeformation(search_start);
+      add_stage_ms(process_profile_.hold_check_ms, stage_start);
+
+      if (can_hold_clear) {
         deformations = active_deformations_;
         active_collision_grace_cycles_ = 0;
         ++active_clear_cycles_;
         state = "holding";
-        logHoldState(closest_index, search_start, search_end, "safe shift search failed");
+        logHoldState(closest_index, search_start, search_end, "temporary clear detection");
       } else {
-        state = "unsafe";
-        if (hasActiveDeformation()) {
+        stage_start = std::chrono::steady_clock::now();
+        const bool can_release_hold = canReleaseHoldActiveDeformation();
+        add_stage_ms(process_profile_.release_check_ms, stage_start);
+
+        if (can_release_hold) {
           deformations = active_deformations_;
           ++active_clear_cycles_;
+          state = "holding";
+          logHoldState(closest_index, search_start, search_end, "release hysteresis");
         } else {
           clearActiveDeformation();
+          logClearState();
         }
-        logUnsafeState(
-          collision_indices.size(),
-          cluster_count,
-          closest_index,
-          search_start,
-          search_end,
-          !deformations.empty());
       }
-    } else if (state != "holding" && canHoldActiveDeformation(search_start)) {
-      deformations = active_deformations_;
-      active_collision_grace_cycles_ = 0;
-      ++active_clear_cycles_;
-      state = "holding";
-      logHoldState(closest_index, search_start, search_end, "temporary clear detection");
-    } else if (state != "holding" && canReleaseHoldActiveDeformation()) {
-      deformations = active_deformations_;
-      ++active_clear_cycles_;
-      state = "holding";
-      logHoldState(closest_index, search_start, search_end, "release hysteresis");
-    } else if (state != "holding") {
-      clearActiveDeformation();
-      logClearState();
     }
 
     std::vector<PathDeformation> metrics_deformations = deformations;
@@ -2499,10 +2617,14 @@ private:
       state = "committed";
     }
 
+    stage_start = std::chrono::steady_clock::now();
     const auto corrected_path = makeCorrectedPath(deformations);
+    add_stage_ms(process_profile_.make_path_ms, stage_start);
+    stage_start = std::chrono::steady_clock::now();
     pub_path_->publish(corrected_path);
     publishMarker(corrected_path);
     publishDynamicAccMarkers(dynamic_acc_search_start);
+    add_stage_ms(process_profile_.publish_ms, stage_start);
     writeMetrics(
       state,
       closest_index,
@@ -2552,7 +2674,14 @@ private:
       << "window_start,window_end,shift_min,shift_max,"
       << "robot_radius,vehicle_width,vehicle_length,footprint_margin,map_resolution,"
       << "shift_step,max_shift,allow_opposite_shift,collision_check_step,output_poses,"
-      << "process_ms,deformation_detail,failure_detail\n";
+      << "process_ms,range_ms,hold_check_ms,release_check_ms,detect_collision_ms,cluster_ms,"
+      << "shift_sign_ms,find_safe_shift_ms,partial_update_ms,merge_ms,smooth_ms,make_path_ms,"
+      << "publish_ms,estimate_shift_sign_calls,estimate_side_clearance_calls,safe_shift_calls,"
+      << "safe_shift_successes,safe_shift_failures,shift_candidates_tested,"
+      << "corrected_window_collision_calls,deformations_collision_calls,path_range_collision_calls,"
+      << "segment_collision_calls,deformation_trigger_collision_calls,footprint_collision_calls,"
+      << "scan_trigger_collision_calls,map_trigger_collision_calls,shifted_waypoint_calls,"
+      << "deformation_detail,failure_detail\n";
     metrics_file_.flush();
 
     RCLCPP_INFO(
@@ -2646,6 +2775,33 @@ private:
       << effectiveCollisionCheckStep() << ','
       << global_path_.size() << ','
       << process_ms << ','
+      << process_profile_.range_ms << ','
+      << process_profile_.hold_check_ms << ','
+      << process_profile_.release_check_ms << ','
+      << process_profile_.detect_collision_ms << ','
+      << process_profile_.cluster_ms << ','
+      << process_profile_.shift_sign_ms << ','
+      << process_profile_.find_safe_shift_ms << ','
+      << process_profile_.partial_update_ms << ','
+      << process_profile_.merge_ms << ','
+      << process_profile_.smooth_ms << ','
+      << process_profile_.make_path_ms << ','
+      << process_profile_.publish_ms << ','
+      << profile_counters_.estimate_shift_sign_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.estimate_side_clearance_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.safe_shift_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.safe_shift_successes.load(std::memory_order_relaxed) << ','
+      << profile_counters_.safe_shift_failures.load(std::memory_order_relaxed) << ','
+      << profile_counters_.shift_candidates_tested.load(std::memory_order_relaxed) << ','
+      << profile_counters_.corrected_window_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.deformations_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.path_range_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.segment_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.deformation_trigger_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.footprint_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.scan_trigger_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.map_trigger_collision_calls.load(std::memory_order_relaxed) << ','
+      << profile_counters_.shifted_waypoint_calls.load(std::memory_order_relaxed) << ','
       << makeDeformationDetail(deformations) << ','
       << joinDetails(failure_details) << '\n';
 
@@ -2660,6 +2816,12 @@ private:
   {
     const auto elapsed = std::chrono::steady_clock::now() - start;
     return std::chrono::duration<double, std::milli>(elapsed).count();
+  }
+
+  void resetProfiling()
+  {
+    process_profile_ = ProcessProfile{};
+    profile_counters_.reset();
   }
 
   std::string makeDeformationDetail(const std::vector<PathDeformation> & deformations) const
@@ -3039,6 +3201,8 @@ private:
     "/home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv"};
   std::string metrics_actual_csv_path_;
   std::ofstream metrics_file_;
+  ProcessProfile process_profile_;
+  mutable ProfileCounters profile_counters_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_map_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_path_;
