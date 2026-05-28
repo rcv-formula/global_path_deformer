@@ -2341,8 +2341,8 @@ private:
     }
 
     std::vector<DynamicPoint> active_points;
-    active_points.reserve(dynamic_points_.size());
     if (dynamicPointcloudFresh()) {
+      active_points.reserve(dynamic_points_.size());
       for (size_t i = 0; i < dynamic_points_.size(); ++i) {
         const auto & point = dynamic_points_[i];
         if (!dynamicPointPassesAccGeometry(point)) {
