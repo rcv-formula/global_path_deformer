@@ -223,12 +223,8 @@ public:
     dynamic_acc_speed_margin_ = declare_parameter<double>("dynamic_acc_speed_margin", 0.0);
     dynamic_acc_min_speed_ = declare_parameter<double>("dynamic_acc_min_speed", 0.0);
     curvature_speed_limit_enabled_ = declare_parameter<bool>("curvature_speed_limit_enabled", true);
-    curvature_yaw_slowdown_start_ =
-      declare_parameter<double>("curvature_yaw_slowdown_start", 0.25);
-    curvature_yaw_slowdown_full_ =
-      declare_parameter<double>("curvature_yaw_slowdown_full", 0.80);
-    curvature_min_speed_scale_ = declare_parameter<double>("curvature_min_speed_scale", 0.45);
-    curvature_min_speed_ = declare_parameter<double>("curvature_min_speed", 0.05);
+    curvature_lateral_accel_limit_ =
+      declare_parameter<double>("curvature_lateral_accel_limit", 0.60);
 
     robot_radius_ = declare_parameter<double>("robot_radius", 0.14);
     vehicle_width_ = declare_parameter<double>("vehicle_width", 0.28);
@@ -2411,27 +2407,37 @@ private:
     return limited_speed;
   }
 
-  double normalizeAngle(double angle) const
+  double waypointDistance(const Waypoint & a, const Waypoint & b) const
   {
-    return std::atan2(std::sin(angle), std::cos(angle));
+    return std::hypot(b.x - a.x, b.y - a.y);
   }
 
-  double shiftedPathYawAtIndex(int index, const std::vector<Waypoint> & shifted_path) const
+  double shiftedPathCurvatureAtIndex(int index, const std::vector<Waypoint> & shifted_path) const
   {
-    if (shifted_path.empty()) return 0.0;
+    const int size = static_cast<int>(shifted_path.size());
+    if (size < 3 || index < 0 || index >= size) return 0.0;
 
-    const int last_index = static_cast<int>(shifted_path.size()) - 1;
-    int i0 = std::max(0, index - 1);
-    int i1 = std::min(last_index, index + 1);
-
-    if (closed_loop_path_ && shifted_path.size() > 2) {
-      i0 = (index == 0) ? last_index : index - 1;
-      i1 = (index == last_index) ? 0 : index + 1;
+    int i0 = index - 1;
+    int i2 = index + 1;
+    if (closed_loop_path_) {
+      i0 = (index == 0) ? size - 1 : index - 1;
+      i2 = (index == size - 1) ? 0 : index + 1;
+    } else if (i0 < 0 || i2 >= size) {
+      return 0.0;
     }
 
-    return std::atan2(
-      shifted_path[i1].y - shifted_path[i0].y,
-      shifted_path[i1].x - shifted_path[i0].x);
+    const auto & p0 = shifted_path[i0];
+    const auto & p1 = shifted_path[index];
+    const auto & p2 = shifted_path[i2];
+    const double a = waypointDistance(p0, p1);
+    const double b = waypointDistance(p1, p2);
+    const double c = waypointDistance(p0, p2);
+    if (a < 1e-6 || b < 1e-6 || c < 1e-6) return 0.0;
+
+    const double cross = std::abs(
+      (p1.x - p0.x) * (p2.y - p0.y) -
+      (p1.y - p0.y) * (p2.x - p0.x));
+    return 2.0 * cross / (a * b * c);
   }
 
   double applyCurvatureVelocityLimit(
@@ -2443,20 +2449,55 @@ private:
       return nominal_speed;
     }
 
-    const double start = std::max(0.0, curvature_yaw_slowdown_start_);
-    const double full = std::max(start + 1e-6, curvature_yaw_slowdown_full_);
-    const double min_scale = std::clamp(curvature_min_speed_scale_, 0.0, 1.0);
-    const double yaw_error = std::abs(normalizeAngle(
-      shiftedPathYawAtIndex(index, shifted_path) - pathYawAtIndex(index)));
-
-    if (yaw_error <= start) {
+    const double lateral_accel_limit = std::max(0.0, curvature_lateral_accel_limit_);
+    if (lateral_accel_limit <= 0.0) {
       return nominal_speed;
     }
 
-    const double ratio = std::clamp((yaw_error - start) / (full - start), 0.0, 1.0);
-    const double scale = 1.0 - ratio * (1.0 - min_scale);
-    const double limited_speed = nominal_speed * scale;
-    return std::clamp(limited_speed, std::max(0.0, curvature_min_speed_), nominal_speed);
+    const double curvature = shiftedPathCurvatureAtIndex(index, shifted_path);
+    if (!std::isfinite(curvature) || curvature <= 1e-6) {
+      return nominal_speed;
+    }
+
+    const double limited_speed = std::sqrt(lateral_accel_limit / curvature);
+    return std::clamp(limited_speed, 0.0, nominal_speed);
+  }
+
+  void applyDeformationWindowCurvatureVelocityLimits(
+    const std::vector<Waypoint> & shifted_path,
+    const std::vector<PathDeformation> & deformations,
+    std::vector<double> & speeds) const
+  {
+    if (!curvature_speed_limit_enabled_ || shifted_path.size() != speeds.size()) return;
+
+    for (const auto & deformation : deformations) {
+      if (!deformation.active()) continue;
+
+      double window_limit = std::numeric_limits<double>::infinity();
+      bool has_limit = false;
+      forEachIndexInForwardRange(deformation.window.start, deformation.window.end, [&](int i) {
+        if (i < 0 || i >= static_cast<int>(shifted_path.size())) return;
+        const double limited_speed =
+          applyCurvatureVelocityLimit(i, global_path_[i].v, shifted_path);
+        if (limited_speed < global_path_[i].v) {
+          window_limit = std::min(window_limit, limited_speed);
+          has_limit = true;
+        }
+      });
+
+      if (!has_limit || !std::isfinite(window_limit)) continue;
+
+      forEachIndexInForwardRange(deformation.window.start, deformation.window.end, [&](int i) {
+        if (i < 0 || i >= static_cast<int>(speeds.size())) return;
+        const double beta = blendingWeight(i, deformation.window);
+        if (beta <= 0.0) return;
+
+        const double current_speed = speeds[i];
+        const double target_speed = current_speed -
+          beta * std::max(0.0, current_speed - window_limit);
+        speeds[i] = std::min(speeds[i], target_speed);
+      });
+    }
   }
 
   nav_msgs::msg::Path makeCorrectedPath(
@@ -2473,17 +2514,23 @@ private:
       shifted_path.push_back(shiftedWaypoint(i, deformations));
     }
 
+    std::vector<double> speeds;
+    speeds.reserve(shifted_path.size());
+    for (int i = 0; i < static_cast<int>(shifted_path.size()); ++i) {
+      speeds.push_back(global_path_[i].v);
+    }
+    applyDeformationWindowCurvatureVelocityLimits(shifted_path, deformations, speeds);
+    for (double & speed : speeds) {
+      speed = applyDynamicAccVelocityLimit(speed);
+    }
+
     for (int i = 0; i < static_cast<int>(shifted_path.size()); ++i) {
       geometry_msgs::msg::PoseStamped ps;
       ps.header = path.header;
 
-      double speed = global_path_[i].v;
-      speed = applyCurvatureVelocityLimit(i, speed, shifted_path);
-      speed = applyDynamicAccVelocityLimit(speed);
-
       ps.pose.position.x = shifted_path[i].x;
       ps.pose.position.y = shifted_path[i].y;
-      ps.pose.position.z = speed;
+      ps.pose.position.z = speeds[i];
       ps.pose.orientation.w = 1.0;
       path.poses.push_back(ps);
     }
@@ -3443,10 +3490,7 @@ private:
   double dynamic_acc_speed_margin_{0.0};
   double dynamic_acc_min_speed_{0.0};
   bool curvature_speed_limit_enabled_{true};
-  double curvature_yaw_slowdown_start_{0.25};
-  double curvature_yaw_slowdown_full_{0.80};
-  double curvature_min_speed_scale_{0.45};
-  double curvature_min_speed_{0.05};
+  double curvature_lateral_accel_limit_{0.60};
   std::string metrics_csv_path_{
     "/home/rcv/Documents/global_path_deformer/metrics/global_path_deformer_metrics.csv"};
   std::string metrics_actual_csv_path_;

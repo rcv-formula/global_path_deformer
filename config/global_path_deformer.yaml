@@ -28,22 +28,19 @@ global_path_deformer:
     dynamic_acc_hysteresis_ms: 300
     dynamic_acc_front_yaw_limit: 0.60
     dynamic_acc_lateral_width: 0.60
-    dynamic_acc_min_distance: 0.80
-    dynamic_acc_max_distance: 4.00
+    dynamic_acc_min_distance: 1.30
+    dynamic_acc_max_distance: 5.00
     dynamic_acc_time_headway: 1.00
-    dynamic_acc_distance_gain: 0.80
+    dynamic_acc_distance_gain: 0.3
     dynamic_acc_speed_margin: 0.0
     dynamic_acc_min_speed: 0.0
-    curvature_speed_limit_enabled: true
-    curvature_yaw_slowdown_start: 0.25
-    curvature_yaw_slowdown_full: 0.80
-    curvature_min_speed_scale: 0.45
-    curvature_min_speed: 0.05
+    curvature_speed_limit_enabled: false
+    curvature_lateral_accel_limit: 3.5
 
     robot_radius: 0.14
     vehicle_width: 0.28
     vehicle_length: 0.512
-    footprint_margin: 0.10
+    footprint_margin: 0.05
     map_collision_enabled: true
     map_occupied_requires_scan_confirmation: false
     map_occupied_scan_confirmation_radius: 0.20
@@ -67,14 +64,14 @@ global_path_deformer:
     scan_overlay_boundary_extra_margin: 0.05
     scan_overlay_trigger_extra_margin: 0.12
     scan_overlay_trigger_lateral_width: 0.35
-    scan_overlay_trigger_forward_distance: 1.00
+    scan_overlay_trigger_forward_distance: 1.0
     scan_overlay_near_trigger_radius: 0.45
     scan_overlay_sensor_x: 0.0
     scan_overlay_sensor_y: 0.0
     scan_overlay_sensor_yaw: 0.0
 
-    backward_waypoints: 12
-    forward_waypoints: 8
+    backward_waypoints: 15
+    forward_waypoints: 10
     deformation_tail_waypoints: 8
     gap_tolerance: 2
     max_collision_cluster_span: 8
@@ -86,7 +83,7 @@ global_path_deformer:
 
     use_full_path_search: false
     collision_search_start_ahead_waypoints: 3
-    collision_search_lookahead_waypoints: 80
+    collision_search_lookahead_waypoints: 100
     dynamic_acc_search_start_ahead_waypoints: 3
     dynamic_acc_search_lookahead_waypoints: 80
     deformation_hold_cycles: -1
@@ -111,6 +108,6 @@ global_path_deformer:
     parallel_threads: 4
     parallel_min_items: 16
 
-    metrics_enabled: true
+    metrics_enabled: false
     metrics_csv_path: /home/rcv/global_path_deformer/metrics/global_path_deformer_metrics.csv
     metrics_flush_period: 20
