@@ -19,7 +19,7 @@ global_path_deformer:
     dynamic_acc_enabled: true
     dynamic_acc_marker_enabled: true
     dynamic_acc_requires_path_window: true
-    dynamic_acc_path_lateral_width: 0.60
+    dynamic_acc_path_lateral_width: 0.3
     dynamic_acc_path_forward_distance: 1.00
     dynamic_acc_path_extra_margin: 0.0
     dynamic_acc_ttl_ms: 500
