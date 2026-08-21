@@ -1047,7 +1047,7 @@ private:
       std::max(footprint_half_width, map_trigger_lateral_width_) :
       footprint_half_width;
     const double forward_limit = map_trigger_forward_distance_ > 0.0 ?
-      std::max(half_length, map_trigger_forward_distance_) :
+      map_trigger_forward_distance_ :
       half_length;
     const double backward_limit = map_trigger_backward_distance_ > 0.0 ?
       map_trigger_backward_distance_ :

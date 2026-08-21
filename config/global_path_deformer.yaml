@@ -2,7 +2,7 @@ global_path_deformer:
   ros__parameters:
     odom_topic: /odom
     realtime_map_topic: /map
-    scan_topic: /scan_matched_points2
+    scan_topic: /scan
     #scan_topic: /static_pointcloud
     dynamic_obstacle_topic: /dynamic_pointcloud
     obstacle_mode_topic: /obstacle_mode
@@ -46,14 +46,14 @@ global_path_deformer:
     map_occupied_scan_confirmation_radius: 0.20
     map_trigger_enabled: true
 
-    map_trigger_extra_margin: 0.15
-    map_trigger_lateral_width: 0.35
-    map_trigger_forward_distance: 0.60
-    map_trigger_backward_distance: 0.40
+    map_trigger_extra_margin: 0.05
+    map_trigger_lateral_width: 0.34
+    map_trigger_forward_distance: 0.30
+    map_trigger_backward_distance: 0.30
     occupied_threshold: 40
     unknown_occupied: true
 
-    scan_overlay_enabled: true
+    scan_overlay_enabled: false  # 이게 scan 자체에 대한 놈
     scan_overlay_ttl_ms: 1200
     scan_overlay_min_range: 0.10
     scan_overlay_max_range: 0.0
@@ -96,8 +96,8 @@ global_path_deformer:
 
     shift_step: 0.15
     max_shift: 1.5
-    minimum_deformation_shift: 0.10
-    deformation_extra_shift: 0.10
+    minimum_deformation_shift: 0.05
+    deformation_extra_shift: 0.05
     deformation_smoothing_alpha: 0.15
     shift_direction_clearance_margin: 0.10
     shift_refine_enabled: true
