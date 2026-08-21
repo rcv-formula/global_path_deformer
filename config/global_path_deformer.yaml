@@ -48,7 +48,8 @@ global_path_deformer:
 
     map_trigger_extra_margin: 0.15
     map_trigger_lateral_width: 0.35
-    map_trigger_forward_distance: 1.00
+    map_trigger_forward_distance: 0.60
+    map_trigger_backward_distance: 0.40
     occupied_threshold: 40
     unknown_occupied: true
 
@@ -71,10 +72,10 @@ global_path_deformer:
     scan_overlay_sensor_yaw: 0.0
 
     backward_waypoints: 15
-    forward_waypoints: 10
+    forward_waypoints: 15
     deformation_tail_waypoints: 8
-    gap_tolerance: 2
-    max_collision_cluster_span: 8
+    gap_tolerance: 4
+    max_collision_cluster_span: 40
 
     closed_loop_path: true
     closest_index_backward_search_waypoints: 5
@@ -95,10 +96,10 @@ global_path_deformer:
 
     shift_step: 0.15
     max_shift: 1.5
-    minimum_deformation_shift: 0.20
-    deformation_extra_shift: 0.15
+    minimum_deformation_shift: 0.10
+    deformation_extra_shift: 0.10
     deformation_smoothing_alpha: 0.15
-    shift_direction_clearance_margin: 0.05
+    shift_direction_clearance_margin: 0.10
     shift_refine_enabled: true
     shift_refine_iterations: 3
     allow_opposite_shift: true

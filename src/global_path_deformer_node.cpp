@@ -239,6 +239,7 @@ public:
     map_trigger_extra_margin_ = declare_parameter<double>("map_trigger_extra_margin", 0.15);
     map_trigger_lateral_width_ = declare_parameter<double>("map_trigger_lateral_width", 0.50);
     map_trigger_forward_distance_ = declare_parameter<double>("map_trigger_forward_distance", 1.20);
+    map_trigger_backward_distance_ = declare_parameter<double>("map_trigger_backward_distance", 0.0);
     occupied_threshold_ = declare_parameter<int>("occupied_threshold", 65);
     unknown_occupied_ = declare_parameter<bool>("unknown_occupied", true);
     scan_overlay_enabled_ = declare_parameter<bool>("scan_overlay_enabled", true);
@@ -1048,7 +1049,10 @@ private:
     const double forward_limit = map_trigger_forward_distance_ > 0.0 ?
       std::max(half_length, map_trigger_forward_distance_) :
       half_length;
-    const double search_radius = std::hypot(forward_limit, half_width);
+    const double backward_limit = map_trigger_backward_distance_ > 0.0 ?
+      map_trigger_backward_distance_ :
+      half_length;
+    const double search_radius = std::hypot(std::max(forward_limit, backward_limit), half_width);
     const int r_cell = static_cast<int>(std::ceil(search_radius / res));
     const double cos_yaw = std::cos(yaw);
     const double sin_yaw = std::sin(yaw);
@@ -1076,7 +1080,7 @@ private:
         const double vy = cell_y - y;
         const double longitudinal = cos_yaw * vx + sin_yaw * vy;
         const double lateral = -sin_yaw * vx + cos_yaw * vy;
-        if (longitudinal >= -half_length &&
+        if (longitudinal >= -backward_limit &&
             longitudinal <= forward_limit &&
             std::abs(lateral) <= half_width) {
           return true;
@@ -3580,6 +3584,7 @@ private:
   double map_trigger_extra_margin_{0.15};
   double map_trigger_lateral_width_{0.50};
   double map_trigger_forward_distance_{1.20};
+  double map_trigger_backward_distance_{0.0};
   int occupied_threshold_{65};
   bool unknown_occupied_{true};
   bool scan_overlay_enabled_{true};
