@@ -46,7 +46,7 @@ global_path_deformer:
     map_occupied_scan_confirmation_radius: 0.20
     map_trigger_enabled: false	# false하면 map도 꺼짐.
 
-    map_trigger_extra_margin: 0.00  # 0.05였음
+    map_trigger_extra_margin: 0.05  # 0.05였음
     map_trigger_lateral_width: 0.34
     map_trigger_forward_distance: 0.30
     map_trigger_backward_distance: 0.30
@@ -97,8 +97,8 @@ global_path_deformer:
     shift_step: 0.15
     max_shift: 1.5
     minimum_deformation_shift: 0.05 # shift의 최소값. 최소 이 값만큼은 민다.
-    deformation_extra_shift: 0.00   # 딱 안전한 값에 추가로 margin을 더 더하기 0.05 -> 0.00
-    deformation_smoothing_alpha: 0.15
+    deformation_extra_shift: 0.03   # 딱 안전한 값에 추가로 margin을 더 더하기 0.05 -> 0.00
+    deformation_smoothing_alpha: 0.01 #0.15였음.
     shift_direction_clearance_margin: 0.10
     shift_refine_enabled: true
     shift_refine_iterations: 3
