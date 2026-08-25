@@ -922,6 +922,12 @@ private:
         const int cost = getCost(cell_mx, cell_my);
         if (isOccupiedCost(cost)) {
           footprint_collision_cache_.emplace(cache_key, true);
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 300,
+            "[DEBUG footprint] query=(%.3f,%.3f) yaw=%.1fdeg longit=%+.3f lateral=%+.3f "
+            "(limits half_len<=%.3f half_w<=%.3f)",
+            x, y, yaw * 180.0 / M_PI, longitudinal, lateral,
+            half_length, half_width);
           return true;
         }
       }
@@ -1083,6 +1089,12 @@ private:
         if (longitudinal >= -backward_limit &&
             longitudinal <= forward_limit &&
             std::abs(lateral) <= half_width) {
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 300,
+            "[DEBUG map_trigger] query=(%.3f,%.3f) yaw=%.1fdeg longit=%+.3f lateral=%+.3f "
+            "(limits fwd<=%.3f back<=%.3f |lat|<=%.3f)",
+            x, y, yaw * 180.0 / M_PI, longitudinal, lateral,
+            forward_limit, backward_limit, half_width);
           return true;
         }
       }
